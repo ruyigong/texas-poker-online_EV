@@ -69,3 +69,10 @@ Straddles are treated like posted blind money before the preflop betting round. 
 The root page now starts with a login screen. The username becomes the poker player name, and the login password is reused as that player's password/PIN.
 
 After login, the lobby shows current rooms, lets players refresh the room list, join a room, or create a named room with a room password. Creating or joining a room opens the poker table view.
+
+
+## Invite Code
+
+Login requires an invite code. Set `POKER_INVITE_CODE` in the environment before deployment. If it is not set, the local default is `evanston`.
+
+The in-room sidebar only shows game controls and a Back to Lobby button. Room creation and joining happen from the lobby.
