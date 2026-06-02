@@ -1,11 +1,12 @@
 import json
+import os
 import random
 import string
 import time
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from itertools import combinations
 from typing import Any
 from uuid import uuid4
@@ -24,7 +25,10 @@ BIG_BLIND = 20
 MAX_SEATS = 10
 DEFAULT_ACTION_TIMEOUT = 60
 BETTING_STAGES = ["preflop", "flop", "turn", "river"]
-HISTORY_ROOT = Path(__file__).resolve().parent.parent / "hand_history"
+APP_ROOT = Path(__file__).resolve().parent.parent
+HISTORY_ROOT = APP_ROOT / "hand_history"
+ROOM_STATE_ROOT = Path(os.environ.get("POKER_STATE_DIR", APP_ROOT / "room_state"))
+ROOM_STATE_VERSION = 1
 
 
 def make_room_code() -> str:
@@ -924,9 +928,68 @@ class Room:
         self.save_hand_history()
 
 
+def player_to_snapshot(player: Player) -> dict[str, Any]:
+    payload = {item.name: getattr(player, item.name) for item in fields(Player)}
+    payload["connected"] = False
+    return payload
+
+
+def player_from_snapshot(payload: dict[str, Any]) -> Player:
+    allowed = {item.name for item in fields(Player)}
+    values = {key: value for key, value in payload.items() if key in allowed}
+    values["connected"] = False
+    return Player(**values)
+
+
+def room_to_snapshot(room: Room) -> dict[str, Any]:
+    payload = {
+        item.name: getattr(room, item.name)
+        for item in fields(Room)
+        if item.name not in {"players", "sockets"}
+    }
+    payload["version"] = ROOM_STATE_VERSION
+    payload["players"] = {player_id: player_to_snapshot(player) for player_id, player in room.players.items()}
+    return payload
+
+
+def room_from_snapshot(payload: dict[str, Any]) -> Room:
+    allowed = {item.name for item in fields(Room)} - {"players", "sockets"}
+    values = {key: value for key, value in payload.items() if key in allowed}
+    room = Room(**values)
+    room.sockets = {}
+    room.players = {
+        player_id: player_from_snapshot(player_payload)
+        for player_id, player_payload in payload.get("players", {}).items()
+        if isinstance(player_payload, dict)
+    }
+    room.message = f"Room {room.code} restored. Players can reconnect."
+    return room
+
+
 class RoomManager:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
+        self.load_rooms()
+
+    def room_state_path(self, code: str) -> Path:
+        return ROOM_STATE_ROOT / f"{code.upper()}.json"
+
+    def persist_room(self, room: Room) -> None:
+        ROOM_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        path = self.room_state_path(room.code)
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(room_to_snapshot(room), indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def load_rooms(self) -> None:
+        if not ROOM_STATE_ROOT.exists():
+            return
+        for path in ROOM_STATE_ROOT.glob("*.json"):
+            try:
+                room = room_from_snapshot(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+            self.rooms[room.code.upper()] = room
 
     def create_room(self, player_name: str) -> tuple[Room, Player]:
         code = make_room_code()
@@ -936,6 +999,7 @@ class RoomManager:
         player = Player(id=str(uuid4()), name=player_name)
         room.players[player.id] = player
         self.rooms[code] = room
+        self.persist_room(room)
         return room, player
 
     def join_room(self, code: str, player_name: str, player_id: str | None = None) -> tuple[Room | None, Player | None]:
@@ -947,6 +1011,7 @@ class RoomManager:
             player = room.players[player_id]
             if player.name.casefold() == normalized_name:
                 player.name = player_name
+                self.persist_room(room)
                 return room, player
             player_id = None
 
@@ -960,23 +1025,27 @@ class RoomManager:
             for duplicate_id in duplicate_ids:
                 room.players.pop(duplicate_id, None)
             existing.name = player_name
+            self.persist_room(room)
             return room, existing
 
         as_spectator = room.stage != "lobby" or room.seated_count() >= MAX_SEATS
         player = Player(id=str(uuid4()), name=player_name, is_spectator=as_spectator)
         room.players[player.id] = player
+        self.persist_room(room)
         return room, player
 
     async def connect(self, room: Room, player: Player, websocket: WebSocket) -> None:
         await websocket.accept()
         player.connected = True
         room.sockets[player.id] = websocket
+        self.persist_room(room)
         await self.broadcast_state(room)
 
     async def disconnect(self, room: Room, player_id: str) -> None:
         if player_id in room.players:
             room.players[player_id].connected = False
         room.sockets.pop(player_id, None)
+        self.persist_room(room)
         await self.broadcast_state(room)
 
     async def broadcast(self, room: Room, payload: dict[str, Any]) -> None:
@@ -1098,6 +1167,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
                 error = room.request_seat(player_id)
             if error:
                 await manager.broadcast(room, {"type": "error", "message": error})
+            else:
+                manager.persist_room(room)
             await manager.broadcast_state(room)
     except WebSocketDisconnect:
         await manager.disconnect(room, player_id)

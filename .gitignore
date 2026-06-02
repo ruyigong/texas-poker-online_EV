@@ -4,3 +4,4 @@ __pycache__/
 .env
 .pytest_cache/
 hand_history/
+room_state/

@@ -30,3 +30,16 @@ Render start command:
 ```powershell
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
+
+
+## Persistent Rooms
+
+Rooms are saved as JSON snapshots after create/join/reconnect and after successful game actions.
+
+By default, snapshots are written to `room_state/`. You can override that location with:
+
+```powershell
+$env:POKER_STATE_DIR="G:\Poker Online\room_state"
+```
+
+On Render, the normal filesystem is ephemeral. For rooms to survive Render restarts and deploys reliably, use a paid web service with a persistent disk and set `POKER_STATE_DIR` to a folder on that disk, such as `/data/room_state`.
