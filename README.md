@@ -50,3 +50,10 @@ On Render, the normal filesystem is ephemeral. For rooms to survive Render resta
 When creating a room, enter a room password and share it privately with friends. Joining a protected room requires that password unless the browser already has a valid reconnect token for a player in that room.
 
 Passwords are stored as hashes in room snapshots. Existing rooms without a password remain open until recreated with a password.
+
+
+## Player Passwords
+
+Use the player password field as a per-name PIN. If a player name already exists in a room, another browser must provide the matching player password to reclaim that player. A browser with the original reconnect token can still reconnect without retyping the player password.
+
+Player passwords are stored as hashes in room snapshots. Existing players without a password can claim/set one the next time they rejoin with a player password.
