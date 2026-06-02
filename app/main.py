@@ -28,7 +28,7 @@ MAX_SEATS = 10
 DEFAULT_ACTION_TIMEOUT = 60
 BETTING_STAGES = ["preflop", "flop", "turn", "river"]
 APP_ROOT = Path(__file__).resolve().parent.parent
-HISTORY_ROOT = APP_ROOT / "hand_history"
+HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT", APP_ROOT / "hand_history"))
 ROOM_STATE_ROOT = Path(os.environ.get("POKER_STATE_DIR", APP_ROOT / "room_state"))
 ROOM_STATE_VERSION = 1
 INVITE_CODE = os.environ.get("POKER_INVITE_CODE", "evanston")
@@ -250,8 +250,13 @@ class Room:
             return 0.0
         return round(max(0.0, time.time() - self.last_action_started_at), 1)
 
-    def log_action(self, player: Player, action: str, amount: int = 0, note: str = "", thinking_time: float | None = None, stack_before: int | None = None, stack_after: int | None = None) -> None:
-        self.action_log.append({
+    def append_history_entry(self, entry: dict[str, Any], persist: bool = True) -> None:
+        self.action_log.append(entry)
+        if persist:
+            self.write_hand_history(completed=self.stage == "showdown")
+
+    def log_action(self, player: Player, action: str, amount: int = 0, note: str = "", thinking_time: float | None = None, stack_before: int | None = None, stack_after: int | None = None, cards: list[str] | None = None) -> None:
+        entry = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "stage": self.stage,
             "playerId": player.id,
@@ -263,13 +268,45 @@ class Room:
             "note": note,
             "stackBefore": stack_before,
             "stackAfter": stack_after,
-        })
+        }
+        if cards is not None:
+            entry["cards"] = cards
+        self.append_history_entry(entry)
+
+    def log_system_action(self, action: str, note: str = "", cards: list[str] | None = None) -> None:
+        entry = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "stage": self.stage,
+            "playerId": "",
+            "player": "System",
+            "action": action,
+            "amount": 0,
+            "pot": self.pot,
+            "thinkingTime": 0.0,
+            "note": note,
+            "stackBefore": None,
+            "stackAfter": None,
+        }
+        if cards is not None:
+            entry["cards"] = cards
+        self.append_history_entry(entry)
+
+    def log_board_deal(self) -> None:
+        if self.stage == "flop":
+            cards = self.community_cards[:3]
+            self.log_system_action("deal flop", note=" ".join(cards), cards=cards)
+        elif self.stage == "turn":
+            cards = self.community_cards[3:4]
+            self.log_system_action("deal turn", note=" ".join(cards), cards=cards)
+        elif self.stage == "river":
+            cards = self.community_cards[4:5]
+            self.log_system_action("deal river", note=" ".join(cards), cards=cards)
 
     def log_result(self) -> None:
         if not self.winners:
             return
         summary = "; ".join(f"{winner['name']} wins {winner['amount']} with {winner['hand']}" for winner in self.winners if winner.get("amount", 0) > 0)
-        self.action_log.append({
+        self.append_history_entry({
             "time": datetime.now().isoformat(timespec="seconds"),
             "stage": "result",
             "playerId": "",
@@ -281,7 +318,7 @@ class Room:
             "note": "hand complete",
             "stackBefore": None,
             "stackAfter": None,
-        })
+        }, persist=False)
 
     def hand_stack_summary(self) -> list[dict[str, Any]]:
         summaries = []
@@ -299,31 +336,69 @@ class Room:
             summaries.append({"playerId": player_id, "name": name, "before": before, "after": after})
         return summaries
 
-    def save_hand_history(self) -> None:
-        if not self.hand_id:
-            return
-        stack_summary = self.hand_stack_summary()
-        folder = HISTORY_ROOT / self.hand_id
-        folder.mkdir(parents=True, exist_ok=True)
-        payload = {
+    def board_by_street(self, completed: bool = False) -> dict[str, list[str]]:
+        visible_count = 5 if completed else len(self.visible_community())
+        return {
+            "flop": self.community_cards[:3] if visible_count >= 3 else [],
+            "turn": self.community_cards[3:4] if visible_count >= 4 else [],
+            "river": self.community_cards[4:5] if visible_count >= 5 else [],
+        }
+
+    def player_hand_summary(self, include_cards: bool = False) -> list[dict[str, Any]]:
+        players = []
+        for player in self.seated_players():
+            item = {
+                "playerId": player.id,
+                "name": player.name,
+                "folded": player.folded,
+                "cardsVisible": player.cards_visible,
+                "finalStack": player.chips,
+            }
+            if include_cards:
+                item["cards"] = player.cards
+            else:
+                item["cardCount"] = len(player.cards)
+            players.append(item)
+        return players
+
+    def hand_history_payload(self, completed: bool = False) -> dict[str, Any]:
+        board = self.board_by_street(completed)
+        return {
             "roomCode": self.code,
+            "roomName": self.name or self.code,
             "handId": self.hand_id,
+            "status": "completed" if completed else "in_progress",
             "startedAt": self.hand_started_at,
-            "endedAt": datetime.now().isoformat(timespec="seconds"),
+            "endedAt": datetime.now().isoformat(timespec="seconds") if completed else None,
             "smallBlind": self.small_blind,
             "bigBlind": self.big_blind,
-            "communityCards": self.community_cards,
+            "communityCards": board["flop"] + board["turn"] + board["river"],
+            "board": board,
             "winners": self.winners,
-            "stacks": stack_summary,
+            "stacks": self.hand_stack_summary(),
+            "players": self.player_hand_summary(include_cards=completed),
             "actions": self.action_log,
         }
+
+    def write_hand_history(self, completed: bool = False) -> dict[str, Any] | None:
+        if not self.hand_id:
+            return None
+        folder = HISTORY_ROOT / self.hand_id
+        folder.mkdir(parents=True, exist_ok=True)
+        payload = self.hand_history_payload(completed)
         (folder / "betting_history.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def save_hand_history(self) -> None:
+        payload = self.write_hand_history(completed=True)
+        if payload is None:
+            return
         summary = {
             "handId": self.hand_id,
             "endedAt": payload["endedAt"],
             "winners": self.winners,
-            "stacks": stack_summary,
-            "path": str(folder / "betting_history.json"),
+            "stacks": payload["stacks"],
+            "path": str(HISTORY_ROOT / self.hand_id / "betting_history.json"),
         }
         self.previous_hands = [hand for hand in self.previous_hands if hand.get("handId") != self.hand_id]
         self.previous_hands.append(summary)
@@ -808,6 +883,7 @@ class Room:
         else:
             self.start_showdown_reveal()
             return
+        self.log_board_deal()
         self.turn_index = self.next_actor_from(self.dealer_index)
         if self.round_complete():
             self.advance_stage()
