@@ -486,7 +486,7 @@ class Room:
                 "remaining": max(0, self.squid_total - self.squid_claimed),
                 "settlements": self.squid_settlements if self.squid_active else [],
                 "holders": [{"name": player.name, "squids": player.squids} for player in self.seated_players() if player.squids > 0],
-                "canConfigure": self.stage in {"lobby", "showdown"},
+                "canConfigure": (not self.squid_active) or self.stage in {"lobby", "showdown"},
                 "minimum": self.min_squid_total(),
             },
             "canStartHand": self.can_start_hand(),
@@ -584,8 +584,8 @@ class Room:
         return len([player for player in self.seated_players() if player.connected])
 
     def configure_squid(self, total: int, price: int) -> str | None:
-        if self.stage not in {"lobby", "showdown"}:
-            return "Squid settings can be changed only between hands."
+        if self.squid_active and self.stage not in {"lobby", "showdown"}:
+            return "Active squid settings can be changed only between hands."
         if total < 0 or price < 0:
             return "Squid count and price cannot be negative."
         min_total = self.min_squid_total()
