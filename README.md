@@ -62,3 +62,10 @@ Player passwords are stored as hashes in room snapshots. Existing players withou
 ## Straddle Rule
 
 Straddles are treated like posted blind money before the preflop betting round. After the straddle option ends, preflop action starts after the last straddler, so the last straddler receives the final preflop option if nobody raises.
+
+
+## Login And Lobby
+
+The root page now starts with a login screen. The username becomes the poker player name, and the login password is reused as that player's password/PIN.
+
+After login, the lobby shows current rooms, lets players refresh the room list, join a room, or create a named room with a room password. Creating or joining a room opens the poker table view.
