@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 app = FastAPI(title="Texas Poker Online")
 
@@ -54,6 +54,44 @@ def room_code_from_name(room_name: str) -> str:
 def history_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-_")
     return slug[:48] or "room"
+
+
+def history_file_path(hand_id: str) -> Path | None:
+    safe_id = history_slug(hand_id)
+    if safe_id != hand_id:
+        return None
+    root = HISTORY_ROOT.resolve()
+    path = (root / hand_id / "betting_history.json").resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path
+
+def list_saved_histories(limit: int = 50) -> list[dict[str, Any]]:
+    if not HISTORY_ROOT.exists():
+        return []
+    items = []
+    for path in HISTORY_ROOT.glob("*/betting_history.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            payload = {}
+        stat = path.stat()
+        hand_id = path.parent.name
+        items.append({
+            "handId": payload.get("handId") or hand_id,
+            "roomCode": payload.get("roomCode", ""),
+            "roomName": payload.get("roomName", ""),
+            "status": payload.get("status", "unknown"),
+            "startedAt": payload.get("startedAt"),
+            "endedAt": payload.get("endedAt"),
+            "updatedAt": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+            "url": f"/history/{hand_id}",
+            "downloadUrl": f"/history/{hand_id}/download",
+        })
+    items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+    return items[:limit]
 
 
 def make_deck() -> list[str]:
@@ -1115,7 +1153,7 @@ class RoomManager:
             return
         for path in ROOM_STATE_ROOT.glob("*.json"):
             try:
-                room = room_from_snapshot(json.loads(path.read_text(encoding="utf-8")))
+                room = room_from_snapshot(json.loads(path.read_text(encoding="utf-8-sig")))
             except Exception:
                 continue
             self.rooms[room.code.upper()] = room
@@ -1245,6 +1283,31 @@ async def login(payload: dict[str, str]) -> JSONResponse:
     if INVITE_CODE and invite_code != INVITE_CODE:
         return JSONResponse({"error": "Incorrect invite code."}, status_code=403)
     return JSONResponse({"username": username})
+
+
+@app.get("/history")
+async def list_history() -> JSONResponse:
+    return JSONResponse({"historyRoot": str(HISTORY_ROOT), "hands": list_saved_histories()})
+
+
+@app.get("/history/{hand_id}")
+async def get_history(hand_id: str) -> JSONResponse:
+    path = history_file_path(hand_id)
+    if path is None or not path.exists():
+        return JSONResponse({"error": "History not found"}, status_code=404)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return JSONResponse({"error": "Could not read history"}, status_code=500)
+    return JSONResponse(payload)
+
+
+@app.get("/history/{hand_id}/download")
+async def download_history(hand_id: str):
+    path = history_file_path(hand_id)
+    if path is None or not path.exists():
+        return JSONResponse({"error": "History not found"}, status_code=404)
+    return FileResponse(path, media_type="application/json", filename=f"{hand_id}.json")
 
 
 @app.get("/lobby", response_class=HTMLResponse)
