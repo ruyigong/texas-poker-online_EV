@@ -159,6 +159,7 @@ class Room:
     action_timeout: int = DEFAULT_ACTION_TIMEOUT
     action_deadline: float | None = None
     straddle_index: int = 0
+    last_straddler_index: int | None = None
     straddle_amount: int = 0
     cards_revealed: bool = True
     stage: str = "lobby"
@@ -590,6 +591,7 @@ class Room:
         self.turn_index = self.straddle_index
         self.straddle_amount = self.big_blind * 2
         self.straddle_count = 0
+        self.last_straddler_index = None
         self.last_aggressor_id = None
         self.river_aggressor_id = None
         self.showdown_order = []
@@ -616,7 +618,10 @@ class Room:
         self.stage = "preflop"
         self.cards_revealed = True
         self.straddle_amount = 0
-        self.turn_index = self.next_actor_from(self.straddle_index - 1)
+        for player in self.seated_players():
+            player.acted = not player.can_act()
+        start_index = self.last_straddler_index if self.last_straddler_index is not None else self.straddle_index - 1
+        self.turn_index = self.next_actor_from(start_index)
         self.start_action_clock()
         seated = self.seated_players()
         self.message = f"Cards are live. {seated[self.turn_index].name}'s turn."
@@ -632,6 +637,7 @@ class Room:
         paid = self.contribute(player, max(0, self.straddle_amount - player.current_bet))
         player.cards_visible = True
         player.acted = True
+        self.last_straddler_index = self.seated_players().index(player)
         self.current_bet = max(self.current_bet, player.current_bet)
         self.log_action(player, "straddle", player.current_bet, note=f"paid {paid}", stack_before=player.chips + paid, stack_after=player.chips)
         self.min_raise = max(self.big_blind, self.current_bet - self.big_blind)

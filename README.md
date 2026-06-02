@@ -57,3 +57,8 @@ Passwords are stored as hashes in room snapshots. Existing rooms without a passw
 Use the player password field as a per-name PIN. If a player name already exists in a room, another browser must provide the matching player password to reclaim that player. A browser with the original reconnect token can still reconnect without retyping the player password.
 
 Player passwords are stored as hashes in room snapshots. Existing players without a password can claim/set one the next time they rejoin with a player password.
+
+
+## Straddle Rule
+
+Straddles are treated like posted blind money before the preflop betting round. After the straddle option ends, preflop action starts after the last straddler, so the last straddler receives the final preflop option if nobody raises.
