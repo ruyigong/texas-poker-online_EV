@@ -43,3 +43,10 @@ $env:POKER_STATE_DIR="G:\Poker Online\room_state"
 ```
 
 On Render, the normal filesystem is ephemeral. For rooms to survive Render restarts and deploys reliably, use a paid web service with a persistent disk and set `POKER_STATE_DIR` to a folder on that disk, such as `/data/room_state`.
+
+
+## Room Passwords
+
+When creating a room, enter a room password and share it privately with friends. Joining a protected room requires that password unless the browser already has a valid reconnect token for a player in that room.
+
+Passwords are stored as hashes in room snapshots. Existing rooms without a password remain open until recreated with a password.
