@@ -28,7 +28,7 @@ MAX_SEATS = 10
 DEFAULT_ACTION_TIMEOUT = 60
 BETTING_STAGES = ["preflop", "flop", "turn", "river"]
 APP_ROOT = Path(__file__).resolve().parent.parent
-HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT", APP_ROOT / "hand_history"))
+HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT", APP_ROOT / "hand_history_online"))
 ROOM_STATE_ROOT = Path(os.environ.get("POKER_STATE_DIR", APP_ROOT / "room_state"))
 ROOM_STATE_VERSION = 1
 INVITE_CODE = os.environ.get("POKER_INVITE_CODE", "evanston")
@@ -48,6 +48,11 @@ def make_room_code() -> str:
 def room_code_from_name(room_name: str) -> str:
     code = re.sub(r"[^A-Za-z0-9_-]+", "-", room_name.strip()).strip("-_")
     return code[:32].upper()
+
+
+def history_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-_")
+    return slug[:48] or "room"
 
 
 def make_deck() -> list[str]:
@@ -239,7 +244,8 @@ class Room:
 
     def begin_hand_history(self) -> None:
         stamp = datetime.now()
-        self.hand_id = f"{stamp.strftime('%Y%m%d_%H%M%S')}_{self.code}"
+        room_slug = history_slug(self.name or self.code)
+        self.hand_id = f"{stamp.strftime('%Y%m%d_%H%M%S')}_{room_slug}_{self.code}"
         self.hand_started_at = stamp.isoformat(timespec="seconds")
         self.action_log = []
         self.hand_start_stacks = {player.id: {"name": player.name, "before": player.chips} for player in self.seated_players()}
