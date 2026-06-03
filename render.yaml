@@ -3,7 +3,7 @@ services:
     runtime: python
     name: texas-poker
     plan: free
-    autoDeployTrigger: commit
+    autoDeployTrigger: off
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
