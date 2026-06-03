@@ -1269,9 +1269,24 @@ class Room:
         remaining = [candidate for candidate in self.active_players() if not candidate.folded]
         if len(remaining) == 1:
             winner = remaining[0]
-            amount = self.pot
-            winner.chips += amount
-            self.winners = [{"id": winner.id, "name": winner.name, "amount": amount, "hand": "Uncontested"}]
+            contribution_levels = sorted({candidate.total_bet for candidate in self.seated_players() if candidate.total_bet > 0})
+            previous_level = 0
+            amount = 0
+            for level in contribution_levels:
+                contributors = [candidate for candidate in self.seated_players() if candidate.total_bet >= level]
+                side_pot = (level - previous_level) * len(contributors)
+                previous_level = level
+                if side_pot <= 0:
+                    continue
+                if len(contributors) == 1:
+                    receiver = contributors[0]
+                    before = receiver.chips
+                    receiver.chips += side_pot
+                    self.log_action(receiver, "return", side_pot, note="uncalled side pot", thinking_time=0.0, stack_before=before, stack_after=receiver.chips)
+                elif winner.total_bet >= level:
+                    winner.chips += side_pot
+                    amount += side_pot
+            self.winners = [{"id": winner.id, "name": winner.name, "amount": amount, "hand": "Uncontested"}] if amount > 0 else []
             self.pot = 0
             self.stage = "showdown"
             self.message = f"{winner.name} wins {amount}." + (self.maybe_award_squid(winner) if winner.cards_visible else "") + self.award_deuce_seven_bounty([winner])
