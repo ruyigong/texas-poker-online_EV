@@ -1666,10 +1666,10 @@ async def health() -> JSONResponse:
 async def login(payload: dict[str, str]) -> JSONResponse:
     username = payload.get("username", "").strip()
     password = payload.get("password", "")
-    invite_code = payload.get("inviteCode", "")
+    invite_code = payload.get("inviteCode", "").strip()
     if not username or not password:
         return JSONResponse({"error": "Enter username and password."}, status_code=400)
-    if INVITE_CODE and invite_code != INVITE_CODE:
+    if INVITE_CODE and invite_code.casefold() != INVITE_CODE.strip().casefold():
         return JSONResponse({"error": "Incorrect invite code."}, status_code=403)
     return JSONResponse({"username": username})
 
