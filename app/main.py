@@ -1418,6 +1418,7 @@ class Room:
         previous_level = 0
         awarded: dict[str, dict[str, Any]] = {}
         board_results: list[str] = []
+        board_one_squid_candidates: list[Player] = []
         for level in contribution_levels:
             contributors = [player for player in self.seated_players() if player.total_bet >= level]
             eligible = [player for player in contenders if player.total_bet >= level]
@@ -1443,6 +1444,10 @@ class Room:
                 scores = {player.id: evaluate_best(player.cards + board) for player in eligible}
                 best_score = max(scores[player.id] for player in eligible)
                 winners = [player for player in eligible if scores[player.id] == best_score]
+                if board_index == 0:
+                    for winner in winners:
+                        if winner not in board_one_squid_candidates:
+                            board_one_squid_candidates.append(winner)
                 prize = board_prize // len(winners)
                 remainder = board_prize % len(winners)
                 winner_names = []
@@ -1458,7 +1463,11 @@ class Room:
                     board_results.append(f"Board {board_index + 1}: {', '.join(winner_names)} wins {board_prize} with {hand_name(best_score[0])}")
         self.winners = [winner for winner in awarded.values() if winner.get("amount", 0) > 0]
         squid_note = ""
-        if len(self.winners) == 1:
+        if len(boards) > 1:
+            for squid_winner in board_one_squid_candidates:
+                if squid_winner.cards_visible:
+                    squid_note += self.maybe_award_squid(squid_winner)
+        elif len(self.winners) == 1:
             squid_winner = self.players.get(self.winners[0]["id"])
             if squid_winner is not None and squid_winner.cards_visible:
                 squid_note = self.maybe_award_squid(squid_winner)
