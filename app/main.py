@@ -417,7 +417,7 @@ class Room:
     def log_result(self) -> None:
         if not self.winners:
             return
-        summary = "; ".join(f"{winner['name']} wins {winner['amount']} with {winner['hand']}" for winner in self.winners if winner.get("amount", 0) > 0)
+        summary = "; ".join(f"{winner['name']} wins {winner['amount']}" for winner in self.winners if winner.get("amount", 0) > 0)
         self.append_history_entry({
             "time": datetime.now().isoformat(timespec="seconds"),
             "stage": "result",
@@ -1569,7 +1569,7 @@ class Room:
             if squid_winner is not None and squid_winner.cards_visible:
                 squid_note = self.maybe_award_squid(squid_winner)
         bounty_note = self.award_deuce_seven_bounty([self.players[winner["id"]] for winner in self.winners if winner["id"] in self.players])
-        result_parts = [f"{winner['name']} wins {winner['amount']} with {winner['hand']}" for winner in self.winners]
+        result_parts = [f"{winner['name']} wins {winner['amount']}" for winner in self.winners]
         board_note = ("\n" + "\n".join(board_results)) if board_results else ""
         self.message = ("; ".join(result_parts) + "." if result_parts else "No chips awarded.") + board_note + squid_note + bounty_note
         self.pot = 0
