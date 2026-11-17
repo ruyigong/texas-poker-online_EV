@@ -31,7 +31,8 @@ const tableAudio = (() => {
   let track;
   let uploading = false;
   let sharingVideo = false;
-  let watchingVideo = false;
+  let audioEnabled = false;
+  let videoHidden = false;
   let embedded;
   let youtubeAPI;
   let sharedVideoId;
@@ -53,16 +54,17 @@ const tableAudio = (() => {
     return input;
   }
 
-  const musicVolume = bindVolume("musicVolume", applyMusicVolume);
+  const musicVolume = bindVolume("musicVolume", () => applyMusicVolume(true));
   const effectsVolume = bindVolume("effectsVolume", applyEffectsVolume);
 
-  function applyMusicVolume() {
+  function applyMusicVolume(forceUnmute = false) {
     const musicLevel = Number(musicVolume.value);
     if (musicGain) musicGain.gain.value = musicLevel / 100;
     if (embedded?.ready) {
       embedded.player.setVolume(musicLevel);
       if (musicLevel === 0) embedded.player.mute();
-      else embedded.player.unMute();
+      else if (forceUnmute || embedded.musicMuted) embedded.player.unMute();
+      embedded.musicMuted = musicLevel === 0;
     }
   }
 
@@ -107,6 +109,8 @@ const tableAudio = (() => {
 
   function unlockAudio() {
     if (!session) return;
+    audioEnabled = true;
+    if (track?.video && !embedded && !videoHidden) openVideo();
     try {
       const audio = getContext();
       if (audio && audio.state !== "running") audio.resume().catch(refreshControls);
@@ -119,7 +123,7 @@ const tableAudio = (() => {
     fileInput.disabled = !session || uploading || sharingVideo || !AudioContextClass;
     shareVideo.disabled = !session || uploading || sharingVideo;
     play.disabled = fileInput.disabled || !fileInput.files.length;
-    enable.hidden = !session || !AudioContextClass || context?.state === "running";
+    enable.hidden = !session || (audioEnabled && (!AudioContextClass || context?.state === "running"));
   }
 
   function stopSource() {
@@ -143,10 +147,11 @@ const tableAudio = (() => {
     videoTitle.textContent = next?.video ? status.textContent : "";
     if (next?.video && next.id === sharedVideoId) {
       sharedVideoId = null;
-      watchingVideo = true;
+      audioEnabled = true;
+      videoHidden = false;
       videoSection.scrollIntoView({block: "nearest"});
     }
-    if (next?.video && watchingVideo) openVideo();
+    if (next?.video && audioEnabled && !videoHidden) openVideo();
   }
 
   function elapsed(current) {
@@ -211,8 +216,14 @@ const tableAudio = (() => {
     }
     if ((music?.id ?? null) === (track?.id ?? null)) {
       if (track?.video) {
+        const indexChanged = track.video.index !== music.video.index;
+        track.video = music.video;
         track.elapsed = music.elapsed;
         track.receivedAt = performance.now();
+        if (indexChanged && embedded?.playlistReady && embedded.player.getPlaylistIndex() !== music.video.index) {
+          embedded.autoStart = true;
+          embedded.startWhenVisible();
+        }
       }
       return;
     }
@@ -233,7 +244,7 @@ const tableAudio = (() => {
     session = null;
     uploading = false;
     sharingVideo = false;
-    watchingVideo = false;
+    videoHidden = false;
     sharedVideoId = null;
     videoUrl.value = "";
     videoRequestStatus.hidden = true;
@@ -262,6 +273,7 @@ const tableAudio = (() => {
     const previous = embedded;
     embedded = null;
     previous?.observer?.disconnect();
+    if (previous) window.clearTimeout(previous.errorRecovery);
     previous?.player?.destroy();
     videoFrame.replaceChildren();
     closeVideo.hidden = true;
@@ -301,22 +313,69 @@ const tableAudio = (() => {
       return;
     }
     const time = Math.max(0, elapsed(video.track));
+    const {id, playlist, index} = video.track.video;
+    const player = video.player;
     applyMusicVolume();
-    const duration = video.player.getDuration();
+    if (playlist) {
+      if (!video.playlistReady) return;
+      const items = player.getPlaylist();
+      const skipTo = video.skipTo;
+      video.skipTo = null;
+      const targetIndex = skipTo ?? index ?? Math.max(0, items.indexOf(id));
+      const startSeconds = skipTo == null ? time : 0;
+      const isCurrent = video.started && player.getPlaylistIndex() === targetIndex;
+      if (isCurrent) {
+        player.seekTo(time, true);
+        player.playVideo();
+      } else {
+        player.loadPlaylist({list: playlist, listType: "playlist", index: targetIndex, startSeconds});
+      }
+      video.started = true;
+      showVideoStatus("");
+      return;
+    }
+    const duration = player.getDuration();
     if (duration > 0 && time >= duration) {
-      video.player.pauseVideo();
+      player.pauseVideo();
       showVideoStatus("This room video has ended.");
       return;
     }
     showVideoStatus("");
-    video.player.loadVideoById({videoId: video.track.video.id, startSeconds: time});
+    if (video.started) {
+      player.seekTo(time, true);
+      player.playVideo();
+    } else {
+      video.started = true;
+      player.loadVideoById({videoId: id, startSeconds: time});
+    }
+  }
+
+  async function reportPlaylistPosition(video) {
+    const previous = video.track.video.index ?? -1;
+    const index = video.player.getPlaylistIndex();
+    if (!session || !Number.isInteger(index) || index <= previous || video.reportedIndex === index) return;
+    video.reportedIndex = index;
+    try {
+      await fetch(musicUrl() + "/video/advance", {
+        method: "POST",
+        headers: {
+          "X-Player-Id": session.playerId,
+          "X-Track-Id": video.track.id,
+          "X-From-Index": String(previous),
+          "X-To-Index": String(index),
+          "X-Track-Position": String(Math.min(30, Math.max(0, video.player.getCurrentTime()))),
+        },
+      });
+    } catch {
+      video.reportedIndex = null;
+    }
   }
 
   function openVideo() {
     removeVideo();
     const current = track;
     if (!current?.video) return;
-    const {provider, id, part} = current.video;
+    const {provider, id, part, playlist} = current.video;
     const start = Math.max(0, Math.floor(elapsed(current)));
     const iframe = document.createElement("iframe");
     iframe.title = provider === "youtube" ? "YouTube room video" : "Bilibili room video";
@@ -324,14 +383,18 @@ const tableAudio = (() => {
     iframe.allowFullscreen = true;
     iframe.referrerPolicy = "strict-origin-when-cross-origin";
     const url = provider === "youtube"
-      ? new URL("https://www.youtube.com/embed/" + encodeURIComponent(id))
+      ? new URL("https://www.youtube.com/embed/" + (playlist ? "" : encodeURIComponent(id)))
       : new URL("https://player.bilibili.com/player.html");
     if (provider === "youtube") {
       url.search = new URLSearchParams({enablejsapi: "1", origin: location.origin, playsinline: "1", start});
+      if (playlist) {
+        url.searchParams.set("listType", "playlist");
+        url.searchParams.set("list", playlist);
+      }
     } else {
       url.search = new URLSearchParams({bvid: id, p: part, t: start, autoplay: "1", muted: musicVolume.value === "0" ? "1" : "0"});
     }
-    const video = {track: current, visible: false, ready: false};
+    const video = {track: current, visible: false, ready: false, autoStart: true};
     embedded = video;
     iframe.src = url.href;
     videoFrame.append(iframe);
@@ -342,18 +405,49 @@ const tableAudio = (() => {
       return;
     }
 
-    let autoStart = true;
-    function startWhenVisible() {
-      if (embedded === video && autoStart && video.ready && video.visible && !document.hidden) {
-        autoStart = false;
-        playYouTube(video);
+    function recoverPlaylist(errorCode, retries = 8) {
+      if (embedded !== video) return;
+      const player = video.player;
+      const items = player.getPlaylist?.() || [];
+      const failed = player.getPlaylistIndex?.() ?? -1;
+      if ((!items.length || failed < 0) && retries > 0) {
+        video.errorRecovery = window.setTimeout(() => recoverPlaylist(errorCode, retries - 1), 250);
+        return;
       }
+      const requested = current.video.index ?? Math.max(0, items.indexOf(id));
+      const next = !video.started && failed !== requested ? requested : failed + 1;
+      if (failed >= 0 && next < items.length && video.skippedIndex !== failed) {
+        video.skippedIndex = failed;
+        video.playlistReady = true;
+        video.skipTo = next;
+        video.autoStart = true;
+        video.startWhenVisible();
+        return;
+      }
+      showYouTubeError(errorCode);
     }
+    function showYouTubeError(code) {
+      const message = [101, 150].includes(code)
+        ? "The uploader disabled embedded playback. Share a different YouTube link for room playback."
+        : "This YouTube video cannot play in the embedded player.";
+      showVideoStatus(message, id || undefined);
+    }
+    video.startWhenVisible = () => {
+      if (embedded !== video || !video.autoStart || !video.ready || !video.visible || document.hidden) return;
+      if (playlist && !video.playlistReady) return;
+      video.autoStart = false;
+      playYouTube(video);
+    };
+    video.pauseForVisibility = () => {
+      if (!video.ready) return;
+      if ([1, 3].includes(video.player.getPlayerState())) video.autoStart = true;
+      video.player.pauseVideo();
+    };
     video.observer = new IntersectionObserver(([entry]) => {
       if (embedded !== video) return;
       video.visible = entry.intersectionRatio > 0.5;
-      if (!video.visible && video.ready) video.player.pauseVideo();
-      startWhenVisible();
+      if (!video.visible) video.pauseForVisibility();
+      video.startWhenVisible();
     }, {threshold: [0, 0.51]});
     video.observer.observe(iframe);
     loadYouTubeAPI().then(() => {
@@ -365,22 +459,35 @@ const tableAudio = (() => {
             video.ready = true;
             video.player = event.target;
             applyMusicVolume();
-            startWhenVisible();
+            if (playlist) {
+              video.player.cuePlaylist({list: playlist, listType: "playlist", index: current.video.index ?? 0});
+            }
+            video.startWhenVisible();
           },
           onAutoplayBlocked() {
             if (embedded === video) showVideoStatus("Click Sync to room to play.");
           },
           onError(event) {
             if (embedded !== video) return;
-            const message = [101, 150].includes(event.data)
-              ? "The uploader disabled embedded playback. Share a different YouTube link for room playback."
-              : "This YouTube video cannot play in the embedded player.";
-            showVideoStatus(message, id);
+            if (playlist) {
+              window.clearTimeout(video.errorRecovery);
+              video.errorRecovery = window.setTimeout(() => recoverPlaylist(event.data), 150);
+            } else showYouTubeError(event.data);
           },
           onStateChange(event) {
             if (embedded !== video) return;
-            if (event.data === 1 && (!video.visible || document.hidden)) event.target.pauseVideo();
-            if (event.data === 0) showVideoStatus("This room video has ended.");
+            if (playlist && event.data === 5 && event.target.getPlaylist()?.length) {
+              video.playlistReady = true;
+              video.startWhenVisible();
+            }
+            if (event.data === 1) {
+              window.clearTimeout(video.errorRecovery);
+              if (!video.visible || document.hidden) video.pauseForVisibility();
+              else if (playlist) void reportPlaylistPosition(video);
+            }
+            if (event.data === 0 && (!playlist || event.target.getPlaylistIndex() + 1 >= event.target.getPlaylist()?.length)) {
+              showVideoStatus(playlist ? "This room playlist has ended." : "This room video has ended.");
+            }
           },
         },
       });
@@ -392,16 +499,21 @@ const tableAudio = (() => {
   }
 
   watchVideo.addEventListener("click", () => {
-    watchingVideo = true;
+    audioEnabled = true;
+    videoHidden = false;
+    const alreadyOpen = Boolean(embedded);
+    unlockAudio();
+    if (!alreadyOpen) return;
     if (embedded?.ready) playYouTube(embedded);
     else if (!embedded || track?.video?.provider === "bilibili") openVideo();
   });
   closeVideo.addEventListener("click", () => {
-    watchingVideo = false;
+    videoHidden = true;
     removeVideo();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden && embedded?.ready) embedded.player.pauseVideo();
+    if (document.hidden) embedded?.pauseForVisibility?.();
+    else embedded?.startWhenVisible?.();
   });
 
   videoForm.addEventListener("submit", async event => {
@@ -425,7 +537,8 @@ const tableAudio = (() => {
       videoRequestStatus.hidden = true;
       controls.open = false;
       if (track?.id === result.trackId) {
-        watchingVideo = true;
+        audioEnabled = true;
+        videoHidden = false;
         if (!embedded) openVideo();
         videoSection.scrollIntoView({block: "nearest"});
       } else {
