@@ -3129,13 +3129,14 @@ els.gamePage.addEventListener("click", event => {
 
 function renderScoreboard(state, you, playerColorsByName) {
   const canRemoveBots = you.id === state.hostPlayerId && ["lobby", "showdown"].includes(state.stage);
-  const activeBotIds = new Set(state.players.filter(player => player.isBot).map(player => player.id));
+  const currentPlayers = new Map(state.players.map(player => [player.id, player]));
+  const visibleRows = (state.scoreboard || []).filter(row => row.isPokerGod || currentPlayers.has(row.id));
   const headings = ["Player", "Chips", "Buy-ins", "Net", "VPIP", "PFR"];
   const formatPercent = value => value == null ? "-" : value + "%";
-  const rows = (state.scoreboard || []).map(row => {
+  const rows = visibleRows.map(row => {
     const name = esc(row.name);
     const color = row.isPokerGod ? "#ffe28a" : playerColorsByName[row.name] || "#f7fbff";
-    const remove = canRemoveBots && activeBotIds.has(row.id)
+    const remove = canRemoveBots && currentPlayers.get(row.id)?.isBot
       ? '<button class="bot-tag-btn bot-remove-btn" type="button" data-remove-bot="' + esc(row.id).replaceAll('"', "&quot;") +
         '" aria-label="Remove ' + name.replaceAll('"', "&quot;") + '">Remove</button>' : "";
     const netClass = row.net >= 0 ? "score-net-pos" : "score-net-neg";
