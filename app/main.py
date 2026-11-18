@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -16,7 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
@@ -43,6 +44,7 @@ if RENDER_DISK_MOUNTED:
     DEFAULT_HISTORY_ROOT = RENDER_DATA_ROOT / "hand_history"
 HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT") or DEFAULT_HISTORY_ROOT)
 HISTORY_PERSISTENT = RENDER_DISK_MOUNTED and HISTORY_ROOT.resolve().is_relative_to(RENDER_DATA_ROOT)
+HISTORY_EXPORT_TOKEN_SHA256 = os.environ.get("POKER_HISTORY_EXPORT_TOKEN_SHA256", "")
 HISTORY_MIRROR_ROOTS = [
     APP_ROOT / "hand_history",
     APP_ROOT / "hand_history_online",
@@ -2575,7 +2577,18 @@ async def login(payload: dict[str, str]) -> JSONResponse:
     return JSONResponse({"username": username})
 
 
-@app.get("/history")
+def require_history_access(request: Request) -> None:
+    if not ON_RENDER and request.client and request.client.host in {"127.0.0.1", "::1"}:
+        return
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and token and HISTORY_EXPORT_TOKEN_SHA256:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        if hmac.compare_digest(token_hash, HISTORY_EXPORT_TOKEN_SHA256):
+            return
+    raise HTTPException(status_code=404, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/history", dependencies=[Depends(require_history_access)], include_in_schema=False)
 def list_history(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -2590,10 +2603,10 @@ def list_history(
         "hands": [history_index_item(path, modified) for modified, path in files[offset:offset + limit]],
         "total": len(files),
         "nextOffset": offset + limit if offset + limit < len(files) else None,
-    })
+    }, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/history/archive")
+@app.get("/history/archive", dependencies=[Depends(require_history_access)], include_in_schema=False)
 def download_history_archive(room: str = Query(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")) -> StreamingResponse:
     room_code = room.upper()
     return StreamingResponse(
@@ -2606,7 +2619,7 @@ def download_history_archive(room: str = Query(min_length=1, max_length=64, patt
     )
 
 
-@app.get("/history/{hand_id}")
+@app.get("/history/{hand_id}", dependencies=[Depends(require_history_access)], include_in_schema=False)
 async def get_history(hand_id: str) -> JSONResponse:
     path = history_file_path(hand_id)
     if path is None or not path.exists():
@@ -2615,15 +2628,17 @@ async def get_history(hand_id: str) -> JSONResponse:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return JSONResponse({"error": "Could not read history"}, status_code=500)
-    return JSONResponse(payload)
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/history/{hand_id}/download")
+@app.get("/history/{hand_id}/download", dependencies=[Depends(require_history_access)], include_in_schema=False)
 async def download_history(hand_id: str):
     path = history_file_path(hand_id)
     if path is None or not path.exists():
         return JSONResponse({"error": "History not found"}, status_code=404)
-    return FileResponse(path, media_type="application/json", filename=f"{hand_id}.json")
+    return FileResponse(
+        path, media_type="application/json", filename=f"{hand_id}.json", headers={"Cache-Control": "no-store"}
+    )
 
 
 @app.get("/lobby", response_class=HTMLResponse)
@@ -2941,8 +2956,6 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .squid-status-panel,.scoreboard-panel,.room-video{width:100%}
 .score-player{display:flex;align-items:center;flex-wrap:wrap;gap:2px 6px;min-width:0;overflow-wrap:anywhere}
 .score-player .bot-remove-btn{flex:none;width:auto}
-.history-archive{display:block;padding:6px 10px;color:#9cd8ff;font-size:12px}
-.history-panel.collapsed .history-archive{display:none}
 #roomVideoFrame iframe{min-height:0}
 
 .actions{grid-area:3/1;width:min(100%,1050px);margin:0 auto;padding:6px;gap:5px;
@@ -3072,7 +3085,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
     <input id="musicVolume" type="range" min="0" max="100" value="35" aria-label="Music volume (MP3 and YouTube)">
     <output id="musicVolumeValue" for="musicVolume">35%</output>
   </div>
-</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels"><div class="panel-drawer-header"><strong>Table panels</strong><button id="panelsClose" type="button">Close</button></div><aside id="historyPanel" class="history-panel"><div class="history-title"><span>Betting History</span><button id="historyToggle" class="history-toggle" type="button">Hide</button></div><a id="historyArchive" class="history-archive" href="/history">Download room ZIP</a><div id="previousHands" class="previous-hands"></div><div id="historyList" class="history-list"><div class="history-empty">No betting yet.</div></div></aside><aside id="peekPanel" class="peek-panel"><div class="history-title"><span>Wanna See See</span></div><div id="peekSummary" class="peek-summary"><div class="history-empty">No peeks yet.</div></div></aside><aside id="worshipPanel" class="peek-panel"><div class="history-title"><span>Worship</span></div><div id="worshipSummary" class="peek-summary"><div class="history-empty">No worship yet.</div></div></aside><div id="chatPanel" class="chat-panel"><div class="chat-title">Chat</div><div id="chatMessages" class="chat-messages"></div><div class="chat-compose"><input id="chatInput" maxlength="180" placeholder="Message"><button id="chatSend" type="button">Send</button></div></div><section id="roomVideo" class="room-video" hidden aria-label="Room video">
+</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels"><div class="panel-drawer-header"><strong>Table panels</strong><button id="panelsClose" type="button">Close</button></div><aside id="historyPanel" class="history-panel"><div class="history-title"><span>Betting History</span><button id="historyToggle" class="history-toggle" type="button">Hide</button></div><div id="previousHands" class="previous-hands"></div><div id="historyList" class="history-list"><div class="history-empty">No betting yet.</div></div></aside><aside id="peekPanel" class="peek-panel"><div class="history-title"><span>Wanna See See</span></div><div id="peekSummary" class="peek-summary"><div class="history-empty">No peeks yet.</div></div></aside><aside id="worshipPanel" class="peek-panel"><div class="history-title"><span>Worship</span></div><div id="worshipSummary" class="peek-summary"><div class="history-empty">No worship yet.</div></div></aside><div id="chatPanel" class="chat-panel"><div class="chat-title">Chat</div><div id="chatMessages" class="chat-messages"></div><div class="chat-compose"><input id="chatInput" maxlength="180" placeholder="Message"><button id="chatSend" type="button">Send</button></div></div><section id="roomVideo" class="room-video" hidden aria-label="Room video">
   <div class="room-video-controls">
     <span id="roomVideoTitle"></span>
     <button type="button" id="watchRoomVideo">Watch synced video</button>
@@ -3087,7 +3100,7 @@ const $=id=>document.getElementById(id),els={loginPage:$("loginPage"),lobbyPage:
 const playerColors=["#7dd3fc","#fda4af","#86efac","#c4b5fd","#fb923c","#5eead4","#f0abfc","#93c5fd","#f472b6","#a78bfa"];const suitMap={S:"\u2660",H:"\u2665",D:"\u2666",C:"\u2663"},seatPositions=[[53,97],[14,81],[8,53],[14,25],[33,9],[53,9],[73,9],[92,25],[97,53],[92,81]],
 compactSeatPositions=[[50,93],[11,81],[11,58],[11,34],[20,12],[50,12],[80,12],[89,34],[89,58],[89,81]],
 tableCenter=[53,53];function radialStyle(pos,distance){const tagX=66,tagY=45,dx=tableCenter[0]-pos[0],dy=tableCenter[1]-pos[1],len=Math.hypot(dx,dy)||1;return `--item-x:${Math.round(tagX+(dx/len)*distance)}px;--item-y:${Math.round(tagY+(dy/len)*distance)}px`;}let roomCode=roomCodeFromPath()||localStorage.getItem("roomCode")||"",playerId=localStorage.getItem("playerId")||sessionStorage.getItem("playerId")||"",ws=null,latest=null,timeoutSentAt=0,clockDeadline=0,creatingRoom=false,joiningRoom=false,pendingJoinRoomCode="",settingsDirty=false,appliedSettingsKey="",squidSettingsDirty=false,appliedSquidKey="",lastSoundCount=0,lastWinnerKey="";const playSound=tableAudio.playEffect;if(roomCode)els.roomCode.value=roomCode;els.join.disabled=false;
-function roomCodeFromPath(){const match=location.pathname.match(new RegExp("^/room/([^/]+)$"));return match?decodeURIComponent(match[1]).toUpperCase():""}function setPath(path){if(location.pathname!==path)history.pushState(null,"",path)}function settingsKey(){return `${els.smallBlind.value}|${els.bigBlind.value}|${els.chipsPerBuyIn.value}|${els.actionTimeout.value}|${els.buyTimeSeconds.value}|${els.peekPriceMin.value}|${els.peekPriceMax.value}`}function squidKey(){return `${els.squidTotal.value}|${els.squidPrice.value}|${els.foldSquid.checked}`}function updateSettingsButton(unlocked=true){els.setBlinds.disabled=!unlocked||!settingsDirty}function updateSquidButton(unlocked=true,restartable=false){els.setSquid.disabled=!restartable&&(!unlocked||!squidSettingsDirty)}function authName(){return localStorage.getItem("authName")||""}function authPassword(){return localStorage.getItem("authPassword")||""}function setIdentity(){els.name.value=authName();els.playerPassword.value=authPassword();els.lobbyUser.textContent=authName()?`Signed in as ${authName()}`:""}function showLogin(){tableAudio.reset();setPath("/");els.loginPage.classList.remove("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers()}function showLobby(){tableAudio.reset();setPath("/lobby");setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.remove("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers();loadRooms()}function showGame(){if(roomCode)$("historyArchive").href="/history/archive?room="+encodeURIComponent(roomCode);if(roomCode)setPath(`/room/${encodeURIComponent(roomCode)}`);setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.remove("hidden");closeJoinPrompt()}function openJoinPrompt(code,name,locked){pendingJoinRoomCode=code;els.joinPromptRoom.textContent=`${name||code} ${locked?"requires a room password.":"does not require a room password."}`;els.joinPromptPassword.value="";els.joinPromptPassword.placeholder=locked?"Room password":"Room password (optional)";els.joinPrompt.classList.remove("hidden");setTimeout(()=>els.joinPromptPassword.focus(),0)}function closeJoinPrompt(){pendingJoinRoomCode="";if(els.joinPrompt)els.joinPrompt.classList.add("hidden")}async function loadRooms(){try{const res=await fetch("/rooms"),data=await res.json(),rooms=data.rooms||[];els.roomList.innerHTML=rooms.length?rooms.map(r=>`<div class="room-row"><div><div class="room-name">${esc(r.name)} ${r.hasPassword?"[Locked]":""}</div><div class="room-meta">${String(r.stage).toUpperCase()} | Seats ${r.players}/${r.maxSeats}</div></div><button class="mini" data-room="${r.roomCode}" data-name="${esc(r.name)}" data-locked="${r.hasPassword?1:0}">Join</button><button class="mini danger-mini" data-delete-room="${r.roomCode}" data-name="${esc(r.name)}" ${r.canDelete?"":"disabled"} title="${r.canDelete?"Delete room":"Only when everyone is disconnected"}">Delete</button></div>`).join(""):`<div class="history-empty">No rooms yet.</div>`;els.roomList.querySelectorAll("button[data-room]").forEach(btn=>btn.onclick=()=>openJoinPrompt(btn.dataset.room,btn.dataset.name,btn.dataset.locked==="1"));els.roomList.querySelectorAll("button[data-delete-room]").forEach(btn=>btn.onclick=()=>deleteLobbyRoom(btn.dataset.deleteRoom,btn.dataset.name));}catch(err){els.roomList.innerHTML=`<div class="history-empty">Could not load rooms.</div>`}}async function deleteLobbyRoom(code,name){if(!code)return;if(!confirm(`Delete room ${name||code}?`))return;try{const res=await fetch(`/rooms/${encodeURIComponent(code)}`,{method:"DELETE"}),data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||"Could not delete room");els.lobbyNotice.textContent=`Deleted room ${name||code}.`;loadRooms()}catch(err){els.lobbyNotice.textContent=err.message||"Could not delete room"}}async function createLobbyRoom(){if(!authName()){showLogin();return}try{els.lobbyNotice.textContent="Creating room...";const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),roomName:els.newRoomName.value||"",password:els.newRoomPassword.value||""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not create room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=els.newRoomPassword.value||"";showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not create room"}}async function joinLobbyRoom(code,password=""){if(!authName()){showLogin();return}try{const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),password:password||"",playerId:code===roomCode?(playerId||""):""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not join room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=password||"";closeJoinPrompt();showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not join room"}}
+function roomCodeFromPath(){const match=location.pathname.match(new RegExp("^/room/([^/]+)$"));return match?decodeURIComponent(match[1]).toUpperCase():""}function setPath(path){if(location.pathname!==path)history.pushState(null,"",path)}function settingsKey(){return `${els.smallBlind.value}|${els.bigBlind.value}|${els.chipsPerBuyIn.value}|${els.actionTimeout.value}|${els.buyTimeSeconds.value}|${els.peekPriceMin.value}|${els.peekPriceMax.value}`}function squidKey(){return `${els.squidTotal.value}|${els.squidPrice.value}|${els.foldSquid.checked}`}function updateSettingsButton(unlocked=true){els.setBlinds.disabled=!unlocked||!settingsDirty}function updateSquidButton(unlocked=true,restartable=false){els.setSquid.disabled=!restartable&&(!unlocked||!squidSettingsDirty)}function authName(){return localStorage.getItem("authName")||""}function authPassword(){return localStorage.getItem("authPassword")||""}function setIdentity(){els.name.value=authName();els.playerPassword.value=authPassword();els.lobbyUser.textContent=authName()?`Signed in as ${authName()}`:""}function showLogin(){tableAudio.reset();setPath("/");els.loginPage.classList.remove("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers()}function showLobby(){tableAudio.reset();setPath("/lobby");setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.remove("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers();loadRooms()}function showGame(){if(roomCode)setPath(`/room/${encodeURIComponent(roomCode)}`);setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.remove("hidden");closeJoinPrompt()}function openJoinPrompt(code,name,locked){pendingJoinRoomCode=code;els.joinPromptRoom.textContent=`${name||code} ${locked?"requires a room password.":"does not require a room password."}`;els.joinPromptPassword.value="";els.joinPromptPassword.placeholder=locked?"Room password":"Room password (optional)";els.joinPrompt.classList.remove("hidden");setTimeout(()=>els.joinPromptPassword.focus(),0)}function closeJoinPrompt(){pendingJoinRoomCode="";if(els.joinPrompt)els.joinPrompt.classList.add("hidden")}async function loadRooms(){try{const res=await fetch("/rooms"),data=await res.json(),rooms=data.rooms||[];els.roomList.innerHTML=rooms.length?rooms.map(r=>`<div class="room-row"><div><div class="room-name">${esc(r.name)} ${r.hasPassword?"[Locked]":""}</div><div class="room-meta">${String(r.stage).toUpperCase()} | Seats ${r.players}/${r.maxSeats}</div></div><button class="mini" data-room="${r.roomCode}" data-name="${esc(r.name)}" data-locked="${r.hasPassword?1:0}">Join</button><button class="mini danger-mini" data-delete-room="${r.roomCode}" data-name="${esc(r.name)}" ${r.canDelete?"":"disabled"} title="${r.canDelete?"Delete room":"Only when everyone is disconnected"}">Delete</button></div>`).join(""):`<div class="history-empty">No rooms yet.</div>`;els.roomList.querySelectorAll("button[data-room]").forEach(btn=>btn.onclick=()=>openJoinPrompt(btn.dataset.room,btn.dataset.name,btn.dataset.locked==="1"));els.roomList.querySelectorAll("button[data-delete-room]").forEach(btn=>btn.onclick=()=>deleteLobbyRoom(btn.dataset.deleteRoom,btn.dataset.name));}catch(err){els.roomList.innerHTML=`<div class="history-empty">Could not load rooms.</div>`}}async function deleteLobbyRoom(code,name){if(!code)return;if(!confirm(`Delete room ${name||code}?`))return;try{const res=await fetch(`/rooms/${encodeURIComponent(code)}`,{method:"DELETE"}),data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||"Could not delete room");els.lobbyNotice.textContent=`Deleted room ${name||code}.`;loadRooms()}catch(err){els.lobbyNotice.textContent=err.message||"Could not delete room"}}async function createLobbyRoom(){if(!authName()){showLogin();return}try{els.lobbyNotice.textContent="Creating room...";const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),roomName:els.newRoomName.value||"",password:els.newRoomPassword.value||""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not create room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=els.newRoomPassword.value||"";showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not create room"}}async function joinLobbyRoom(code,password=""){if(!authName()){showLogin();return}try{const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),password:password||"",playerId:code===roomCode?(playerId||""):""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not join room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=password||"";closeJoinPrompt();showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not join room"}}
 function cardEl(card,small=false){if(!card)return `<div class="card back ${small?"small":""}"></div>`;const suit=card.slice(-1),rank=card.slice(0,-1),sym=suitMap[suit]||suit;return `<div class="card ${small?"small":""}"><div class="corner suit-${suit}">${rank}<br>${sym}</div><div class="suit-big suit-${suit}">${sym}</div></div>`}
 function send(action,extra={}){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({action,...extra}))}
 

@@ -42,9 +42,17 @@ With the disk mounted on Render, new hands are saved under
 `/var/data/hand_history` and survive redeploys. Check `/health` for
 `historyPersistent: true` to confirm the live service is using it.
 
-Use **Download room ZIP** in the Betting History panel to download every saved
-hand for that room code. The `/history` index supports `limit` and `offset`, and
-each entry has an individual JSON download link.
+The live site requires the owner's export key for hand-history downloads.
+On the Windows account that holds the key, run this from the project folder:
+
+```powershell
+.\Download-HandHistory.ps1 -Room 1117
+```
+
+The script saves the room ZIP locally. It reads the key from Windows
+user-encrypted storage in `%LOCALAPPDATA%\Poker Online\history-export-key.dpapi`.
+Render's `POKER_HISTORY_EXPORT_TOKEN_SHA256` stores the SHA-256 digest of the
+key. Alternatively, use authenticated Render SSH to copy the files.
 
 
 ## Persistent Rooms

@@ -11,3 +11,6 @@ services:
       name: poker-history
       mountPath: /var/data
       sizeGB: 1
+    envVars:
+      - key: POKER_HISTORY_EXPORT_TOKEN_SHA256
+        value: 3d5fb9e9cdd8f10e7b013f9c3122fbe66b65427bb0895a4a4a504d57dd7e54d1
