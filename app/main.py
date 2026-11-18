@@ -2956,6 +2956,8 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .squid-status-panel,.scoreboard-panel,.room-video{width:100%}
 .score-player{display:flex;align-items:center;flex-wrap:wrap;gap:2px 6px;min-width:0;overflow-wrap:anywhere}
 .score-player .bot-remove-btn{flex:none;width:auto}
+#scoreboardPanel>.move-handle{display:grid}
+#scoreboardPanel.drag-floating{max-height:var(--floating-max-height);overflow-y:auto}
 #roomVideoFrame iframe{min-height:0}
 
 .actions{grid-area:3/1;width:min(100%,1050px);margin:0 auto;padding:6px;gap:5px;
@@ -3130,12 +3132,27 @@ function clampPanel(el, left, top) {
   }
   return next;
 }
+let scoreboardDock;
+function setPanelFloating(el, floating) {
+  if (el === els.scoreboardPanel) {
+    if (floating && el.parentElement !== els.gamePage) {
+      scoreboardDock = document.createComment("Win / Lose panel dock");
+      el.before(scoreboardDock);
+      els.gamePage.appendChild(el);
+    } else if (!floating && scoreboardDock) {
+      scoreboardDock.replaceWith(el);
+      scoreboardDock = null;
+    }
+  }
+  el.classList.toggle("drag-floating", floating);
+}
+
 function applyPanelPosition(el, key) {
   if (draggingPanelKey === key) return;
   const pos = panelPositions[key];
-  const floating = (wideLayout.matches || el === actions)
+  const floating = (wideLayout.matches || el === actions || el === els.scoreboardPanel)
     && Number.isFinite(pos?.left) && Number.isFinite(pos?.top);
-  el.classList.toggle("drag-floating", floating);
+  setPanelFloating(el, floating);
   if (!floating) {
     el.style.left = el.style.top = el.style.width = "";
     return;
@@ -3159,7 +3176,7 @@ function ensureMoveHandle(el, key) {
   handle.textContent = "+";
   el.appendChild(handle);
   handle.onpointerdown = event => {
-    if ((!wideLayout.matches && el !== actions) || event.button !== 0) return;
+    if ((!wideLayout.matches && el !== actions && el !== els.scoreboardPanel) || event.button !== 0) return;
     event.preventDefault();
     const {left, top, width} = el.getBoundingClientRect();
     const startX = event.clientX, startY = event.clientY;
@@ -3171,7 +3188,8 @@ function ensureMoveHandle(el, key) {
       if (!moved && Math.hypot(dx, dy) < 6) return;
       moved = true;
       el.style.width = width + "px";
-      el.classList.add("drag-floating");
+      setPanelFloating(el, true);
+      handle.setPointerCapture(event.pointerId);
       const next = clampPanel(el, left + dx, top + dy);
       el.style.left = next.left + "px";
       el.style.top = next.top + "px";
