@@ -2811,7 +2811,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 
 .table-stage{grid-area:2/1;container-type:size;min-width:0;min-height:0;display:grid;place-items:center}
 .table-shell{width:min(1180px,100cqw,calc(100cqh * 1180 / 650));min-width:0;max-width:100%;margin:0}
-.seats{inset:7% 12%}
+.seats{inset:5.5% 9.5%}
 .seat{left:var(--seat-x);top:var(--seat-y);transform:translate(-50%,-50%) scale(var(--table-scale,1))}
 .seat-cards,.seat-token,.seat-bet{left:var(--item-x);top:var(--item-y)}
 .badge{width:max-content;max-width:140px}
@@ -2851,6 +2851,9 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 
 .actions{grid-area:3/1;width:min(100%,1050px);margin:0 auto;padding:6px;gap:5px;
   grid-template-columns:repeat(9,minmax(0,1fr))}
+.actions.movable-panel{padding-right:36px;z-index:19}
+.actions.movable-panel.drag-floating{z-index:19!important}
+.actions>.move-handle{display:grid;min-height:24px}
 .actions button,.actions input{height:auto;min-height:34px;min-width:0;padding:5px 3px;
   font-size:clamp(11px,1.12vw,14px);white-space:normal;overflow-wrap:anywhere}
 .actions #raiseAmount{min-width:0;font-size:12px}
@@ -2999,18 +3002,20 @@ function savePanelPositions() {
 }
 function clampPanel(el, left, top) {
   const pad = 8;
-  const dockTop = actions.getBoundingClientRect().top;
-  el.style.setProperty("--floating-max-height", Math.max(0, dockTop - pad * 2) + "px");
+  const bottom = el === actions || actions.classList.contains("drag-floating")
+    ? innerHeight : actions.getBoundingClientRect().top;
+  el.style.setProperty("--floating-max-height", Math.max(0, bottom - pad * 2) + "px");
   const {width, height} = el.getBoundingClientRect();
   return {
     left: Math.min(Math.max(pad, left), Math.max(pad, innerWidth - width - pad)),
-    top: Math.min(Math.max(pad, top), Math.max(pad, dockTop - height - pad))
+    top: Math.min(Math.max(pad, top), Math.max(pad, bottom - height - pad))
   };
 }
 function applyPanelPosition(el, key) {
   if (draggingPanelKey === key) return;
   const pos = panelPositions[key];
-  const floating = wideLayout.matches && Number.isFinite(pos?.left) && Number.isFinite(pos?.top);
+  const floating = (wideLayout.matches || el === actions)
+    && Number.isFinite(pos?.left) && Number.isFinite(pos?.top);
   el.classList.toggle("drag-floating", floating);
   if (!floating) {
     el.style.left = el.style.top = el.style.width = "";
@@ -3027,12 +3032,13 @@ function ensureMoveHandle(el, key) {
   const handle = document.createElement("button");
   handle.type = "button";
   handle.className = "move-handle";
-  handle.title = "Move panel (double-click to reset)";
-  handle.setAttribute("aria-label", "Move panel");
+  const label = el === actions ? "Move betting and refill bar" : "Move panel";
+  handle.title = label + " (double-click to reset)";
+  handle.setAttribute("aria-label", label);
   handle.textContent = "+";
   el.appendChild(handle);
   handle.onpointerdown = event => {
-    if (!wideLayout.matches || event.button !== 0) return;
+    if ((!wideLayout.matches && el !== actions) || event.button !== 0) return;
     event.preventDefault();
     const {left, top, width} = el.getBoundingClientRect();
     const startX = event.clientX, startY = event.clientY;
@@ -3069,6 +3075,7 @@ function ensureMoveHandle(el, key) {
 function initMovablePanels() {
   if (els.gamePage.classList.contains("hidden")) return;
   for (const [el, key] of [
+    [actions, "actions"],
     [els.chatPanel, "chat"], [els.historyPanel, "history"], [$("peekPanel"), "peek"],
     [$("worshipPanel"), "worship"], [els.scoreboardPanel, "scoreboard"],
     [els.squidStatus, "squidStatus"], [$("musicSoundPanel"), "musicSound"]
