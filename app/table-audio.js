@@ -22,6 +22,7 @@ const tableAudio = (() => {
     check: new Audio("/audios/check.mp3"),
     fold: new Audio("/audios/fold.mp3"),
     win: new Audio("/audios/winning.mp3"),
+    tomatoHit: new Audio("/audios/tomato-hit.wav"),
   };
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   let context;

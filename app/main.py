@@ -3281,6 +3281,7 @@ function animateTomato({fromId, fromName, targetId, targetName}) {
   };
   const splat = () => {
     if (els.gamePage.classList.contains("hidden")) return;
+    playSound("tomatoHit");
     const currentTarget = findTag(targetId) || els.tableShell;
     const [x, y] = center(currentTarget);
     animate("tomato-splat", [
