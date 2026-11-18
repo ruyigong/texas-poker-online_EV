@@ -333,7 +333,7 @@ class Room:
     peek_price_min: int = 2
     peek_price_max: int = 10
     peek_enabled: bool = True
-    worship_enabled: bool = True
+    worship_enabled: bool = False
     host_player_id: str = ""
     bot_name_counter: int = 0
     removed_scoreboard_rows: list[dict[str, Any]] = field(default_factory=list)
