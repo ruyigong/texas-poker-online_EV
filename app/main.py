@@ -8,14 +8,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from itertools import combinations
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 
@@ -33,8 +35,14 @@ FOLD_SQUID_TIERS = ((9, 16), (7, 8), (5, 4), (3, 2))
 DEFAULT_ACTION_TIMEOUT = 30
 BETTING_STAGES = ["preflop", "flop", "turn", "river"]
 APP_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_HISTORY_DIR = "hand_history_online" if os.environ.get("RENDER") else "hand_history"
-HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT", APP_ROOT / DEFAULT_HISTORY_DIR))
+ON_RENDER = bool(os.environ.get("RENDER"))
+RENDER_DATA_ROOT = Path("/var/data")
+RENDER_DISK_MOUNTED = ON_RENDER and RENDER_DATA_ROOT.is_mount()
+DEFAULT_HISTORY_ROOT = APP_ROOT / ("hand_history_online" if ON_RENDER else "hand_history")
+if RENDER_DISK_MOUNTED:
+    DEFAULT_HISTORY_ROOT = RENDER_DATA_ROOT / "hand_history"
+HISTORY_ROOT = Path(os.environ.get("POKER_HISTORY_ROOT") or DEFAULT_HISTORY_ROOT)
+HISTORY_PERSISTENT = RENDER_DISK_MOUNTED and HISTORY_ROOT.resolve().is_relative_to(RENDER_DATA_ROOT)
 HISTORY_MIRROR_ROOTS = [
     APP_ROOT / "hand_history",
     APP_ROOT / "hand_history_online",
@@ -89,8 +97,7 @@ def history_roots() -> list[Path]:
 
 
 def history_file_path(hand_id: str) -> Path | None:
-    safe_id = history_slug(hand_id)
-    if safe_id != hand_id:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", hand_id):
         return None
     for history_root in history_roots():
         root = history_root.resolve()
@@ -99,41 +106,87 @@ def history_file_path(hand_id: str) -> Path | None:
             path.relative_to(root)
         except ValueError:
             continue
-        if path.exists():
+        if path.is_file():
             return path
-    return (HISTORY_ROOT / hand_id / "betting_history.json").resolve()
+    return None
 
 
-def list_saved_histories(limit: int = 50) -> list[dict[str, Any]]:
-    items = []
+def saved_history_paths() -> Iterator[Path]:
     seen = set()
-    for root in history_roots():
-        if not root.exists():
-            continue
+    for history_root in history_roots():
+        root = history_root.resolve()
         for path in root.glob("*/betting_history.json"):
             hand_id = path.parent.name
-            if hand_id in seen:
+            if hand_id in seen or not re.fullmatch(r"[A-Za-z0-9_-]+", hand_id):
+                continue
+            if not path.is_file() or not path.resolve().is_relative_to(root):
                 continue
             seen.add(hand_id)
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            except Exception:
-                payload = {}
-            stat = path.stat()
-            items.append({
-                "handId": payload.get("handId") or hand_id,
-                "roomCode": payload.get("roomCode", ""),
-                "roomName": payload.get("roomName", ""),
-                "status": payload.get("status", "unknown"),
-                "startedAt": payload.get("startedAt"),
-                "endedAt": payload.get("endedAt"),
-                "updatedAt": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-                "path": str(path),
-                "url": f"/history/{hand_id}",
-                "downloadUrl": f"/history/{hand_id}/download",
-            })
-    items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
-    return items[:limit]
+            yield path
+
+
+def history_index_item(path: Path, modified: float) -> dict[str, Any]:
+    hand_id = path.parent.name
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "handId": payload.get("handId") or hand_id,
+        "roomCode": payload.get("roomCode", ""),
+        "roomName": payload.get("roomName", ""),
+        "status": payload.get("status", "unknown"),
+        "startedAt": payload.get("startedAt"),
+        "endedAt": payload.get("endedAt"),
+        "updatedAt": datetime.fromtimestamp(modified).isoformat(timespec="seconds"),
+        "path": str(path),
+        "url": f"/history/{hand_id}",
+        "downloadUrl": f"/history/{hand_id}/download",
+    }
+
+
+def room_hand_files(room_code: str) -> Iterator[tuple[str, bytes]]:
+    for path in saved_history_paths():
+        hand_id = path.parent.name
+        if not hand_id.upper().endswith("_" + room_code):
+            continue
+        try:
+            data = path.read_bytes()
+            payload = json.loads(data.decode("utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("roomCode", "")).upper() == room_code:
+            yield hand_id + ".json", data
+
+
+class HistoryZipBuffer:
+    """Collect the bytes produced since the previous ZIP entry."""
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+
+    def write(self, data: bytes) -> int:
+        self.pending.extend(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def drain(self) -> bytes:
+        data = bytes(self.pending)
+        self.pending.clear()
+        return data
+
+
+def stream_history_zip(files: Iterator[tuple[str, bytes]]) -> Iterator[bytes]:
+    buffer = HistoryZipBuffer()
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        for name, data in files:
+            archive.writestr(name, data)
+            yield buffer.drain()
+    yield buffer.drain()
 
 def make_deck() -> list[str]:
     deck = [f"{rank}{suit}" for suit in SUITS for rank in RANKS]
@@ -450,7 +503,7 @@ class Room:
     def begin_hand_history(self) -> None:
         stamp = datetime.now()
         room_slug = history_slug(self.name or self.code)
-        self.hand_id = f"{stamp.strftime('%Y%m%d_%H%M%S')}_{room_slug}_{self.code}"
+        self.hand_id = f"{stamp.strftime('%Y%m%d_%H%M%S_%f')}_{room_slug}_{self.code}"
         self.hand_started_at = stamp.isoformat(timespec="seconds")
         self.action_log = []
         self.hand_start_stacks = {player.id: {"name": player.name, "before": player.chips} for player in self.seated_players()}
@@ -732,17 +785,24 @@ class Room:
         payload = self.hand_history_payload(completed)
         text = json.dumps(payload, indent=2)
         wrote = False
-        for root in history_roots():
+        roots = [HISTORY_ROOT] if HISTORY_PERSISTENT else history_roots()
+        for root in roots:
             folder = root / self.hand_id
+            path = folder / "betting_history.json"
+            temporary = folder / f".betting-history-{uuid4().hex}.tmp"
             try:
                 folder.mkdir(parents=True, exist_ok=True)
-                (folder / "betting_history.json").write_text(text, encoding="utf-8")
+                try:
+                    temporary.write_text(text, encoding="utf-8")
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
                 wrote = True
             except OSError as exc:
                 print(f"Could not write hand history to {folder}: {exc}")
         if not wrote:
             print(f"Hand history was not saved for {self.hand_id}")
-        return payload
+        return payload if wrote else None
 
     def save_hand_history(self) -> None:
         self.record_current_hand_stats()
@@ -2500,7 +2560,7 @@ async def get_music(room_code: str, track_id: str, request: Request) -> Response
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "historyPersistent": HISTORY_PERSISTENT})
 
 
 @app.post("/login")
@@ -2516,8 +2576,34 @@ async def login(payload: dict[str, str]) -> JSONResponse:
 
 
 @app.get("/history")
-async def list_history() -> JSONResponse:
-    return JSONResponse({"historyRoot": str(HISTORY_ROOT), "hands": list_saved_histories()})
+def list_history(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    files = sorted(
+        ((path.stat().st_mtime, path) for path in saved_history_paths()),
+        key=lambda entry: (entry[0], entry[1].parent.name),
+        reverse=True,
+    )
+    return JSONResponse({
+        "historyRoot": str(HISTORY_ROOT),
+        "hands": [history_index_item(path, modified) for modified, path in files[offset:offset + limit]],
+        "total": len(files),
+        "nextOffset": offset + limit if offset + limit < len(files) else None,
+    })
+
+
+@app.get("/history/archive")
+def download_history_archive(room: str = Query(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")) -> StreamingResponse:
+    room_code = room.upper()
+    return StreamingResponse(
+        stream_history_zip(room_hand_files(room_code)),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="poker-{room_code}-hands.zip"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.get("/history/{hand_id}")
@@ -2855,6 +2941,8 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .squid-status-panel,.scoreboard-panel,.room-video{width:100%}
 .score-player{display:flex;align-items:center;flex-wrap:wrap;gap:2px 6px;min-width:0;overflow-wrap:anywhere}
 .score-player .bot-remove-btn{flex:none;width:auto}
+.history-archive{display:block;padding:6px 10px;color:#9cd8ff;font-size:12px}
+.history-panel.collapsed .history-archive{display:none}
 #roomVideoFrame iframe{min-height:0}
 
 .actions{grid-area:3/1;width:min(100%,1050px);margin:0 auto;padding:6px;gap:5px;
@@ -2984,7 +3072,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
     <input id="musicVolume" type="range" min="0" max="100" value="35" aria-label="Music volume (MP3 and YouTube)">
     <output id="musicVolumeValue" for="musicVolume">35%</output>
   </div>
-</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels"><div class="panel-drawer-header"><strong>Table panels</strong><button id="panelsClose" type="button">Close</button></div><aside id="historyPanel" class="history-panel"><div class="history-title"><span>Betting History</span><button id="historyToggle" class="history-toggle" type="button">Hide</button></div><div id="previousHands" class="previous-hands"></div><div id="historyList" class="history-list"><div class="history-empty">No betting yet.</div></div></aside><aside id="peekPanel" class="peek-panel"><div class="history-title"><span>Wanna See See</span></div><div id="peekSummary" class="peek-summary"><div class="history-empty">No peeks yet.</div></div></aside><aside id="worshipPanel" class="peek-panel"><div class="history-title"><span>Worship</span></div><div id="worshipSummary" class="peek-summary"><div class="history-empty">No worship yet.</div></div></aside><div id="chatPanel" class="chat-panel"><div class="chat-title">Chat</div><div id="chatMessages" class="chat-messages"></div><div class="chat-compose"><input id="chatInput" maxlength="180" placeholder="Message"><button id="chatSend" type="button">Send</button></div></div><section id="roomVideo" class="room-video" hidden aria-label="Room video">
+</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels"><div class="panel-drawer-header"><strong>Table panels</strong><button id="panelsClose" type="button">Close</button></div><aside id="historyPanel" class="history-panel"><div class="history-title"><span>Betting History</span><button id="historyToggle" class="history-toggle" type="button">Hide</button></div><a id="historyArchive" class="history-archive" href="/history">Download room ZIP</a><div id="previousHands" class="previous-hands"></div><div id="historyList" class="history-list"><div class="history-empty">No betting yet.</div></div></aside><aside id="peekPanel" class="peek-panel"><div class="history-title"><span>Wanna See See</span></div><div id="peekSummary" class="peek-summary"><div class="history-empty">No peeks yet.</div></div></aside><aside id="worshipPanel" class="peek-panel"><div class="history-title"><span>Worship</span></div><div id="worshipSummary" class="peek-summary"><div class="history-empty">No worship yet.</div></div></aside><div id="chatPanel" class="chat-panel"><div class="chat-title">Chat</div><div id="chatMessages" class="chat-messages"></div><div class="chat-compose"><input id="chatInput" maxlength="180" placeholder="Message"><button id="chatSend" type="button">Send</button></div></div><section id="roomVideo" class="room-video" hidden aria-label="Room video">
   <div class="room-video-controls">
     <span id="roomVideoTitle"></span>
     <button type="button" id="watchRoomVideo">Watch synced video</button>
@@ -2999,7 +3087,7 @@ const $=id=>document.getElementById(id),els={loginPage:$("loginPage"),lobbyPage:
 const playerColors=["#7dd3fc","#fda4af","#86efac","#c4b5fd","#fb923c","#5eead4","#f0abfc","#93c5fd","#f472b6","#a78bfa"];const suitMap={S:"\u2660",H:"\u2665",D:"\u2666",C:"\u2663"},seatPositions=[[53,97],[14,81],[8,53],[14,25],[33,9],[53,9],[73,9],[92,25],[97,53],[92,81]],
 compactSeatPositions=[[50,93],[11,81],[11,58],[11,34],[20,12],[50,12],[80,12],[89,34],[89,58],[89,81]],
 tableCenter=[53,53];function radialStyle(pos,distance){const tagX=66,tagY=45,dx=tableCenter[0]-pos[0],dy=tableCenter[1]-pos[1],len=Math.hypot(dx,dy)||1;return `--item-x:${Math.round(tagX+(dx/len)*distance)}px;--item-y:${Math.round(tagY+(dy/len)*distance)}px`;}let roomCode=roomCodeFromPath()||localStorage.getItem("roomCode")||"",playerId=localStorage.getItem("playerId")||sessionStorage.getItem("playerId")||"",ws=null,latest=null,timeoutSentAt=0,clockDeadline=0,creatingRoom=false,joiningRoom=false,pendingJoinRoomCode="",settingsDirty=false,appliedSettingsKey="",squidSettingsDirty=false,appliedSquidKey="",lastSoundCount=0,lastWinnerKey="";const playSound=tableAudio.playEffect;if(roomCode)els.roomCode.value=roomCode;els.join.disabled=false;
-function roomCodeFromPath(){const match=location.pathname.match(new RegExp("^/room/([^/]+)$"));return match?decodeURIComponent(match[1]).toUpperCase():""}function setPath(path){if(location.pathname!==path)history.pushState(null,"",path)}function settingsKey(){return `${els.smallBlind.value}|${els.bigBlind.value}|${els.chipsPerBuyIn.value}|${els.actionTimeout.value}|${els.buyTimeSeconds.value}|${els.peekPriceMin.value}|${els.peekPriceMax.value}`}function squidKey(){return `${els.squidTotal.value}|${els.squidPrice.value}|${els.foldSquid.checked}`}function updateSettingsButton(unlocked=true){els.setBlinds.disabled=!unlocked||!settingsDirty}function updateSquidButton(unlocked=true,restartable=false){els.setSquid.disabled=!restartable&&(!unlocked||!squidSettingsDirty)}function authName(){return localStorage.getItem("authName")||""}function authPassword(){return localStorage.getItem("authPassword")||""}function setIdentity(){els.name.value=authName();els.playerPassword.value=authPassword();els.lobbyUser.textContent=authName()?`Signed in as ${authName()}`:""}function showLogin(){tableAudio.reset();setPath("/");els.loginPage.classList.remove("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers()}function showLobby(){tableAudio.reset();setPath("/lobby");setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.remove("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers();loadRooms()}function showGame(){if(roomCode)setPath(`/room/${encodeURIComponent(roomCode)}`);setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.remove("hidden");closeJoinPrompt()}function openJoinPrompt(code,name,locked){pendingJoinRoomCode=code;els.joinPromptRoom.textContent=`${name||code} ${locked?"requires a room password.":"does not require a room password."}`;els.joinPromptPassword.value="";els.joinPromptPassword.placeholder=locked?"Room password":"Room password (optional)";els.joinPrompt.classList.remove("hidden");setTimeout(()=>els.joinPromptPassword.focus(),0)}function closeJoinPrompt(){pendingJoinRoomCode="";if(els.joinPrompt)els.joinPrompt.classList.add("hidden")}async function loadRooms(){try{const res=await fetch("/rooms"),data=await res.json(),rooms=data.rooms||[];els.roomList.innerHTML=rooms.length?rooms.map(r=>`<div class="room-row"><div><div class="room-name">${esc(r.name)} ${r.hasPassword?"[Locked]":""}</div><div class="room-meta">${String(r.stage).toUpperCase()} | Seats ${r.players}/${r.maxSeats}</div></div><button class="mini" data-room="${r.roomCode}" data-name="${esc(r.name)}" data-locked="${r.hasPassword?1:0}">Join</button><button class="mini danger-mini" data-delete-room="${r.roomCode}" data-name="${esc(r.name)}" ${r.canDelete?"":"disabled"} title="${r.canDelete?"Delete room":"Only when everyone is disconnected"}">Delete</button></div>`).join(""):`<div class="history-empty">No rooms yet.</div>`;els.roomList.querySelectorAll("button[data-room]").forEach(btn=>btn.onclick=()=>openJoinPrompt(btn.dataset.room,btn.dataset.name,btn.dataset.locked==="1"));els.roomList.querySelectorAll("button[data-delete-room]").forEach(btn=>btn.onclick=()=>deleteLobbyRoom(btn.dataset.deleteRoom,btn.dataset.name));}catch(err){els.roomList.innerHTML=`<div class="history-empty">Could not load rooms.</div>`}}async function deleteLobbyRoom(code,name){if(!code)return;if(!confirm(`Delete room ${name||code}?`))return;try{const res=await fetch(`/rooms/${encodeURIComponent(code)}`,{method:"DELETE"}),data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||"Could not delete room");els.lobbyNotice.textContent=`Deleted room ${name||code}.`;loadRooms()}catch(err){els.lobbyNotice.textContent=err.message||"Could not delete room"}}async function createLobbyRoom(){if(!authName()){showLogin();return}try{els.lobbyNotice.textContent="Creating room...";const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),roomName:els.newRoomName.value||"",password:els.newRoomPassword.value||""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not create room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=els.newRoomPassword.value||"";showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not create room"}}async function joinLobbyRoom(code,password=""){if(!authName()){showLogin();return}try{const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),password:password||"",playerId:code===roomCode?(playerId||""):""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not join room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=password||"";closeJoinPrompt();showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not join room"}}
+function roomCodeFromPath(){const match=location.pathname.match(new RegExp("^/room/([^/]+)$"));return match?decodeURIComponent(match[1]).toUpperCase():""}function setPath(path){if(location.pathname!==path)history.pushState(null,"",path)}function settingsKey(){return `${els.smallBlind.value}|${els.bigBlind.value}|${els.chipsPerBuyIn.value}|${els.actionTimeout.value}|${els.buyTimeSeconds.value}|${els.peekPriceMin.value}|${els.peekPriceMax.value}`}function squidKey(){return `${els.squidTotal.value}|${els.squidPrice.value}|${els.foldSquid.checked}`}function updateSettingsButton(unlocked=true){els.setBlinds.disabled=!unlocked||!settingsDirty}function updateSquidButton(unlocked=true,restartable=false){els.setSquid.disabled=!restartable&&(!unlocked||!squidSettingsDirty)}function authName(){return localStorage.getItem("authName")||""}function authPassword(){return localStorage.getItem("authPassword")||""}function setIdentity(){els.name.value=authName();els.playerPassword.value=authPassword();els.lobbyUser.textContent=authName()?`Signed in as ${authName()}`:""}function showLogin(){tableAudio.reset();setPath("/");els.loginPage.classList.remove("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers()}function showLobby(){tableAudio.reset();setPath("/lobby");setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.remove("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers();loadRooms()}function showGame(){if(roomCode)$("historyArchive").href="/history/archive?room="+encodeURIComponent(roomCode);if(roomCode)setPath(`/room/${encodeURIComponent(roomCode)}`);setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.remove("hidden");closeJoinPrompt()}function openJoinPrompt(code,name,locked){pendingJoinRoomCode=code;els.joinPromptRoom.textContent=`${name||code} ${locked?"requires a room password.":"does not require a room password."}`;els.joinPromptPassword.value="";els.joinPromptPassword.placeholder=locked?"Room password":"Room password (optional)";els.joinPrompt.classList.remove("hidden");setTimeout(()=>els.joinPromptPassword.focus(),0)}function closeJoinPrompt(){pendingJoinRoomCode="";if(els.joinPrompt)els.joinPrompt.classList.add("hidden")}async function loadRooms(){try{const res=await fetch("/rooms"),data=await res.json(),rooms=data.rooms||[];els.roomList.innerHTML=rooms.length?rooms.map(r=>`<div class="room-row"><div><div class="room-name">${esc(r.name)} ${r.hasPassword?"[Locked]":""}</div><div class="room-meta">${String(r.stage).toUpperCase()} | Seats ${r.players}/${r.maxSeats}</div></div><button class="mini" data-room="${r.roomCode}" data-name="${esc(r.name)}" data-locked="${r.hasPassword?1:0}">Join</button><button class="mini danger-mini" data-delete-room="${r.roomCode}" data-name="${esc(r.name)}" ${r.canDelete?"":"disabled"} title="${r.canDelete?"Delete room":"Only when everyone is disconnected"}">Delete</button></div>`).join(""):`<div class="history-empty">No rooms yet.</div>`;els.roomList.querySelectorAll("button[data-room]").forEach(btn=>btn.onclick=()=>openJoinPrompt(btn.dataset.room,btn.dataset.name,btn.dataset.locked==="1"));els.roomList.querySelectorAll("button[data-delete-room]").forEach(btn=>btn.onclick=()=>deleteLobbyRoom(btn.dataset.deleteRoom,btn.dataset.name));}catch(err){els.roomList.innerHTML=`<div class="history-empty">Could not load rooms.</div>`}}async function deleteLobbyRoom(code,name){if(!code)return;if(!confirm(`Delete room ${name||code}?`))return;try{const res=await fetch(`/rooms/${encodeURIComponent(code)}`,{method:"DELETE"}),data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||"Could not delete room");els.lobbyNotice.textContent=`Deleted room ${name||code}.`;loadRooms()}catch(err){els.lobbyNotice.textContent=err.message||"Could not delete room"}}async function createLobbyRoom(){if(!authName()){showLogin();return}try{els.lobbyNotice.textContent="Creating room...";const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),roomName:els.newRoomName.value||"",password:els.newRoomPassword.value||""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not create room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=els.newRoomPassword.value||"";showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not create room"}}async function joinLobbyRoom(code,password=""){if(!authName()){showLogin();return}try{const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),password:password||"",playerId:code===roomCode?(playerId||""):""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not join room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=password||"";closeJoinPrompt();showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not join room"}}
 function cardEl(card,small=false){if(!card)return `<div class="card back ${small?"small":""}"></div>`;const suit=card.slice(-1),rank=card.slice(0,-1),sym=suitMap[suit]||suit;return `<div class="card ${small?"small":""}"><div class="corner suit-${suit}">${rank}<br>${sym}</div><div class="suit-big suit-${suit}">${sym}</div></div>`}
 function send(action,extra={}){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({action,...extra}))}
 

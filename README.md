@@ -25,11 +25,26 @@ Open `http://127.0.0.1:8000` in two browser tabs. Create a room in one tab, then
 
 This project includes `render.yaml`.
 
+The Blueprint attaches a 1 GB persistent disk at `/var/data`. To configure a web
+service managed directly in the Render dashboard, attach a persistent disk at the
+same mount path on the existing service.
+
 Render start command:
 
 ```powershell
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
+
+
+## Hand History
+
+With the disk mounted on Render, new hands are saved under
+`/var/data/hand_history` and survive redeploys. Check `/health` for
+`historyPersistent: true` to confirm the live service is using it.
+
+Use **Download room ZIP** in the Betting History panel to download every saved
+hand for that room code. The `/history` index supports `limit` and `offset`, and
+each entry has an individual JSON download link.
 
 
 ## Persistent Rooms
