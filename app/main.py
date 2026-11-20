@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -20,9 +21,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import ClientDisconnect
 
 app = FastAPI(title="Texas Poker Online")
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 SUITS = ["S", "H", "D", "C"]
 RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
@@ -58,10 +61,20 @@ MAX_MUSIC_SECONDS = 15 * 60
 MAX_ROOM_VIDEO_SECONDS = 4 * 60 * 60
 AUDIO_ROOT = APP_ROOT / "audios"
 PICTURE_ROOT = APP_ROOT / "pictures"
+
+
+class CachedStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]) -> Response:
+        response = await super().get_response(path, scope)
+        if response.status_code in {200, 206, 304}:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+
 if AUDIO_ROOT.exists():
-    app.mount("/audios", StaticFiles(directory=AUDIO_ROOT), name="audios")
+    app.mount("/audios", CachedStaticFiles(directory=AUDIO_ROOT), name="audios")
 if PICTURE_ROOT.exists():
-    app.mount("/pictures", StaticFiles(directory=PICTURE_ROOT), name="pictures")
+    app.mount("/pictures", CachedStaticFiles(directory=PICTURE_ROOT), name="pictures")
 
 
 def password_hash(password: str) -> str:
@@ -2239,6 +2252,45 @@ def room_from_snapshot(payload: dict[str, Any]) -> Room:
     return room
 
 
+def table_update_operations(before: Any, after: Any, path: list[Any] | None = None) -> list[list[Any]]:
+    path = [] if path is None else path
+    if type(before) is not type(after):
+        return [["set", path, after]]
+    if isinstance(after, dict):
+        operations = [["delete", [*path, key]] for key in before.keys() - after.keys()]
+        for key, value in after.items():
+            if key not in before:
+                operations.append(["set", [*path, key], value])
+            else:
+                operations.extend(table_update_operations(before[key], value, [*path, key]))
+        return operations
+    if isinstance(after, list):
+        if before == after:
+            return []
+        prefix = 0
+        while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+            prefix += 1
+        suffix = 0
+        while suffix < min(len(before), len(after)) - prefix and before[-suffix - 1] == after[-suffix - 1]:
+            suffix += 1
+        end = len(after) - suffix
+        splice = [["splice", path, prefix, len(before) - prefix - suffix, after[prefix:end]]]
+        if len(before) != len(after):
+            return splice
+        edits = []
+        for index in range(prefix, end):
+            edits.extend(table_update_operations(before[index], after[index], [*path, index]))
+        return min((splice, edits), key=lambda value: len(json.dumps(value, separators=(",", ":"))))
+    return [] if before == after else [["set", path, after]]
+
+
+class TableUpdateStream:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.previous: dict[str, Any] | None = None
+        self.revision = 0
+
+
 class RoomManager:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
@@ -2336,6 +2388,8 @@ class RoomManager:
 
     async def connect(self, room: Room, player: Player, websocket: WebSocket) -> None:
         await websocket.accept()
+        if websocket.query_params.get("updates") == "delta-v1":
+            websocket.state.table_updates = TableUpdateStream()
         player.connected = True
         room.sockets[player.id] = websocket
         room.drive_bots()
@@ -2379,19 +2433,49 @@ class RoomManager:
         disconnected = False
         for player_id, socket in list(room.sockets.items()):
             try:
-                await socket.send_text(json.dumps(payload))
+                await socket.send_text(json.dumps(payload, separators=(",", ":")))
             except Exception:
                 if self.mark_disconnected(room, player_id, socket):
                     disconnected = True
         if disconnected:
             self.persist_room(room)
 
+    async def send_table_state(self, room: Room, player_id: str, socket: WebSocket, force: bool = False) -> None:
+        stream = getattr(socket.state, "table_updates", None)
+        if stream is None:
+            await socket.send_text(json.dumps(room.private_state_for(player_id), separators=(",", ":")))
+            return
+        async with stream.lock:
+            if room.sockets.get(player_id) is not socket:
+                return
+            # Serialize before yielding so later room mutations cannot change the baseline.
+            serialized = json.dumps(room.private_state_for(player_id), separators=(",", ":"))
+            payload = json.loads(serialized)
+            revision = stream.revision + 1
+            full = json.dumps({**payload, "revision": revision}, separators=(",", ":"))
+            message = full
+            if stream.previous is not None and not force:
+                operations = table_update_operations(stream.previous, payload)
+                if not operations:
+                    return
+                delta = json.dumps({
+                    "type": "state_delta",
+                    "baseRevision": stream.revision,
+                    "revision": revision,
+                    "operations": operations,
+                }, separators=(",", ":"))
+                if len(delta) < len(full):
+                    message = delta
+            await socket.send_text(message)
+            stream.previous = payload
+            stream.revision = revision
+
     async def broadcast_state(self, room: Room) -> None:
         while True:
             disconnected = False
             for player_id, socket in list(room.sockets.items()):
                 try:
-                    await socket.send_text(json.dumps(room.private_state_for(player_id)))
+                    await self.send_table_state(room, player_id, socket)
                 except Exception:
                     if self.mark_disconnected(room, player_id, socket):
                         disconnected = True
@@ -2408,6 +2492,15 @@ music_uploads: set[str] = set()
 async def table_audio_script() -> FileResponse:
     return FileResponse(
         Path(__file__).with_name("table-audio.js"),
+        media_type="text/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/table-updates.js", include_in_schema=False)
+async def table_updates_script() -> FileResponse:
+    return FileResponse(
+        Path(__file__).with_name("table-updates.js"),
         media_type="text/javascript",
         headers={"Cache-Control": "no-cache"},
     )
@@ -2728,6 +2821,9 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
                 message = {"action": raw_message}
             action = message.get("action")
             error = None
+            if action == "resync_state":
+                await manager.send_table_state(room, player_id, websocket, force=True)
+                continue
             if action == "throw_tomato":
                 target = room.players.get(str(message.get("targetId", "")))
                 now = time.monotonic()
@@ -2926,6 +3022,8 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .seat-cards,.seat-token,.seat-bet{left:var(--item-x);top:var(--item-y)}
 .badge{width:max-content;max-width:140px}
 .pname{font-size:max(14px,var(--name-size,14px));text-overflow:ellipsis}
+.pname,.pname[data-throw-tomato]{height:auto;min-height:1.7em;line-height:1.45;
+  padding:.05em 2px .2em}
 .pchips{font-size:21px}
 .pstatus{font-size:11px}
 .table{border-width:clamp(5px,1.15cqw,14px);box-shadow:0 0 0 clamp(3px,.85cqw,12px) var(--wood),0 12px 30px #0007}
@@ -3031,7 +3129,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
     transform:translate(-50%,-50%)}
   .badge{top:0;width:100%;min-width:0;min-height:0;padding:2px 3px}
   .badge.active:before{inset:-4px;padding:4px}
-  .pname{font-size:11px;height:15px;line-height:15px}
+  .pname{font-size:11px}
   .pchips{font-size:14px;margin:0;line-height:1.1}
   .pstatus{font-size:9px;margin-top:2px;line-height:1.15}
   .bot-tag-actions{flex-wrap:wrap;gap:1px}
@@ -3099,7 +3197,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
   <div id="roomVideoFrame"></div>
   <p id="roomVideoStatus" role="status" hidden></p>
   <a id="openVideoOnYouTube" target="_blank" rel="noopener noreferrer" hidden>Open on YouTube</a>
-</section><section id="squidStatus" class="squid-status-panel hidden"></section><section id="scoreboardPanel" class="scoreboard-panel"><b>Win / Lose</b><div id="scoreboardRows" class="score-table"></div></section></section><section class="actions" aria-label="Betting and refill"><button id="prefold" class="ghost action-wrap" title="This round only. Check if free, fold if facing a bet.">Check /<br>Fold</button><button id="fold" class="ghost">Fold</button><button id="check" class="ghost">Check</button><button id="call">Call</button><button id="allIn" class="ghost">All-In</button><button id="noStraddle" class="ghost">No Straddle</button><button id="straddle">Straddle</button><input id="raiseAmount" type="number" min="1" placeholder="Enter for raise"><button id="raise">Raise</button><div class="quick-bet-row"><button class="quick-bet" data-pot-percent="0.1" type="button">10%</button><button class="quick-bet" data-pot-percent="0.25" type="button">25%</button><button class="quick-bet" data-pot-percent="0.4" type="button">40%</button><button class="quick-bet" data-pot-percent="0.5" type="button">50%</button><button class="quick-bet" data-pot-percent="0.75" type="button">75%</button><button class="quick-bet" data-pot-percent="1" type="button">100%</button><button class="quick-bet" data-pot-percent="1.5" type="button">150%</button><button class="quick-bet" data-pot-percent="2" type="button">200%</button></div><div id="rebuyPanel" class="rebuy-panel hidden"><div class="refill-label"><label for="rebuyUnits">Refill</label><small id="refillBuyInHint"></small></div><input id="rebuyUnits" aria-describedby="refillBuyInHint" type="number" value="0" step="1"><button id="rebuy">Apply Refill</button></div></section><button id="drawerBackdrop" class="drawer-backdrop" type="button" tabindex="-1" aria-label="Close drawer"></button><div id="allInConfirm" class="action-confirm hidden"><div class="panel"><h2>Lovely action!</h2><div class="panel-sub">But you're sure to all-in?</div><div class="prompt-actions"><button id="allInCancel" class="link-btn mini">Cancel</button><button id="allInConfirmBtn" class="mini">All-In</button></div></div></div></main></div><script src="/table-audio.js"></script>
+</section><section id="squidStatus" class="squid-status-panel hidden"></section><section id="scoreboardPanel" class="scoreboard-panel"><b>Win / Lose</b><div id="scoreboardRows" class="score-table"></div></section></section><section class="actions" aria-label="Betting and refill"><button id="prefold" class="ghost action-wrap" title="This round only. Check if free, fold if facing a bet.">Check /<br>Fold</button><button id="fold" class="ghost">Fold</button><button id="check" class="ghost">Check</button><button id="call">Call</button><button id="allIn" class="ghost">All-In</button><button id="noStraddle" class="ghost">No Straddle</button><button id="straddle">Straddle</button><input id="raiseAmount" type="number" min="1" placeholder="Enter for raise"><button id="raise">Raise</button><div class="quick-bet-row"><button class="quick-bet" data-pot-percent="0.1" type="button">10%</button><button class="quick-bet" data-pot-percent="0.25" type="button">25%</button><button class="quick-bet" data-pot-percent="0.4" type="button">40%</button><button class="quick-bet" data-pot-percent="0.5" type="button">50%</button><button class="quick-bet" data-pot-percent="0.75" type="button">75%</button><button class="quick-bet" data-pot-percent="1" type="button">100%</button><button class="quick-bet" data-pot-percent="1.5" type="button">150%</button><button class="quick-bet" data-pot-percent="2" type="button">200%</button></div><div id="rebuyPanel" class="rebuy-panel hidden"><div class="refill-label"><label for="rebuyUnits">Refill</label><small id="refillBuyInHint"></small></div><input id="rebuyUnits" aria-describedby="refillBuyInHint" type="number" value="0" step="1"><button id="rebuy">Apply Refill</button></div></section><button id="drawerBackdrop" class="drawer-backdrop" type="button" tabindex="-1" aria-label="Close drawer"></button><div id="allInConfirm" class="action-confirm hidden"><div class="panel"><h2>Lovely action!</h2><div class="panel-sub">But you're sure to all-in?</div><div class="prompt-actions"><button id="allInCancel" class="link-btn mini">Cancel</button><button id="allInConfirmBtn" class="mini">All-In</button></div></div></div></main></div><script src="/table-audio.js"></script><script src="/table-updates.js"></script>
 <script>
 const $=id=>document.getElementById(id),els={loginPage:$("loginPage"),lobbyPage:$("lobbyPage"),gamePage:$("gamePage"),sidebarToggle:$("sidebarToggle"),loginName:$("loginName"),loginPassword:$("loginPassword"),inviteCode:$("inviteCode"),loginBtn:$("loginBtn"),loginNotice:$("loginNotice"),lobbyUser:$("lobbyUser"),logoutBtn:$("logoutBtn"),newRoomName:$("newRoomName"),newRoomPassword:$("newRoomPassword"),createLobbyRoom:$("createLobbyRoom"),lobbyNotice:$("lobbyNotice"),joinPrompt:$("joinPrompt"),joinPromptRoom:$("joinPromptRoom"),joinPromptPassword:$("joinPromptPassword"),cancelJoinPrompt:$("cancelJoinPrompt"),confirmJoinPrompt:$("confirmJoinPrompt"),refreshRooms:$("refreshRooms"),roomList:$("roomList"),backLobby:$("backLobby"),name:$("name"),playerPassword:$("playerPassword"),roomPassword:$("roomPassword"),create:$("create"),roomCode:$("roomCode"),join:$("join"),joinSeat:$("joinSeat"),startHand:$("startHand"),shuffleSeats:$("shuffleSeats"),smallBlind:$("smallBlind"),bigBlind:$("bigBlind"),chipsPerBuyIn:$("chipsPerBuyIn"),actionTimeout:$("actionTimeout"),buyTimeSeconds:$("buyTimeSeconds"),peekPriceMin:$("peekPriceMin"),peekPriceMax:$("peekPriceMax"),peekToggle:$("peekToggle"),worshipToggle:$("worshipToggle"),setBlinds:$("setBlinds"),addBot:$("addBot"),squidTotal:$("squidTotal"),squidPrice:$("squidPrice"),foldSquid:$("foldSquid"),setSquid:$("setSquid"),meta:$("meta"),pokerGod:$("pokerGod"),pokerGodChips:$("pokerGodChips"),chatPanel:$("chatPanel"),chatMessages:$("chatMessages"),chatInput:$("chatInput"),chatSend:$("chatSend"),topbar:$("topbar"),tableShell:$("tableShell"),chipFlightLayer:$("chipFlightLayer"),seats:$("seats"),board:$("board"),potLabel:$("potLabel"),clock:$("clock"),tableNotice:$("tableNotice"),centerReadyHost:$("centerReadyHost"),boardChoiceHint:$("boardChoiceHint"),squidStatus:$("squidStatus"),scoreboardPanel:$("scoreboardPanel"),peekSummary:$("peekSummary"),worshipSummary:$("worshipSummary"),previousHands:$("previousHands"),historyList:$("historyList"),historyPanel:$("historyPanel"),historyToggle:$("historyToggle"),buyTime:$("buyTime"),showEndedHand:$("showEndedHand"),hand:$("hand"),notice:$("notice"),prefold:$("prefold"),fold:$("fold"),check:$("check"),call:$("call"),allIn:$("allIn"),noStraddle:$("noStraddle"),straddle:$("straddle"),raiseAmount:$("raiseAmount"),raise:$("raise"),rebuyPanel:$("rebuyPanel"),readyNext:$("readyNext"),rebuyUnits:$("rebuyUnits"),refillBuyInHint:$("refillBuyInHint"),rebuy:$("rebuy"),allInConfirm:$("allInConfirm"),allInCancel:$("allInCancel"),allInConfirmBtn:$("allInConfirmBtn")};
 const playerColors=["#7dd3fc","#fda4af","#86efac","#c4b5fd","#fb923c","#5eead4","#f0abfc","#93c5fd","#f472b6","#a78bfa"];const suitMap={S:"\u2660",H:"\u2665",D:"\u2666",C:"\u2663"},seatPositions=[[53,97],[14,81],[8,53],[14,25],[33,9],[53,9],[73,9],[92,25],[97,53],[92,81]],
@@ -3227,7 +3325,45 @@ function initMovablePanels() {
   }
 }
 function quickBetTo(percent){if(!latest||!latest.state||!latest.you)return;const s=latest.state,you=latest.you,minRaiseTo=Math.max((s.currentBet||0)+(s.minRaise||s.bigBlind),s.bigBlind),betSize=Math.max(s.minRaise||s.bigBlind,Math.round((s.pot||0)*percent)),maxTo=(you.currentBet||0)+(you.chips||0),target=Math.max(minRaiseTo,(s.currentBet||0)+betSize);els.raiseAmount.value=Math.max(0,Math.min(target,maxTo));}
-function connect(){if(!roomCode||!playerId)return;if(ws)ws.close();clearTimeout(tomatoNoticeTimeout);tomatoNotice.textContent="";tableAudio.reset();const proto=location.protocol==="https:"?"wss":"ws";ws=new WebSocket(`${proto}://${location.host}/ws/${roomCode}/${playerId}`);const socket=ws;socket.onclose=()=>{if(ws===socket)tableAudio.reset()};socket.onmessage=e=>{if(ws!==socket)return;try{const p=JSON.parse(e.data);if(p.type==="state"){render(p);if(!els.gamePage.classList.contains("hidden"))tableAudio.update(p.state.roomCode,p.you.id,p.music);initMovablePanels()}if(p.type==="tomato"&&!els.gamePage.classList.contains("hidden"))animateTomato(p);if(p.type==="error")els.notice.textContent=p.message}catch(err){console.error(err);els.notice.textContent="Could not render the latest table update. Please refresh."}}}
+function connect() {
+  if (!roomCode || !playerId) return;
+  if (ws) ws.close();
+  clearTimeout(tomatoNoticeTimeout);
+  tomatoNotice.textContent = "";
+  tableAudio.reset();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${proto}://${location.host}/ws/${roomCode}/${playerId}?updates=delta-v1`);
+  ws = socket;
+  const receiveState = createTableUpdateReceiver(() => {
+    socket.send(JSON.stringify({action: "resync_state"}));
+  });
+  socket.onclose = () => {
+    if (ws === socket) tableAudio.reset();
+  };
+  socket.onmessage = event => {
+    if (ws !== socket) return;
+    try {
+      const message = JSON.parse(event.data);
+      const payload = message.type === "state" || message.type === "state_delta"
+        ? receiveState(message) : message;
+      if (!payload) return;
+      if (payload.type === "state") {
+        render(payload);
+        if (!els.gamePage.classList.contains("hidden")) {
+          tableAudio.update(payload.state.roomCode, payload.you.id, payload.music);
+        }
+        initMovablePanels();
+      }
+      if (payload.type === "tomato" && !els.gamePage.classList.contains("hidden")) {
+        animateTomato(payload);
+      }
+      if (payload.type === "error") els.notice.textContent = payload.message;
+    } catch (error) {
+      console.error(error);
+      els.notice.textContent = "Could not render the latest table update. Please refresh.";
+    }
+  };
+}
 function timerProgress(){if(!latest||!latest.state||!clockDeadline)return 1;const started=latest.state.actionStartedAt?Math.round(latest.state.actionStartedAt*1000):0,total=started?Math.max(1,(clockDeadline-started)/1000):Math.max(1,Number(latest.state.actionTimeout)||1),left=Math.max(0,(clockDeadline-Date.now())/1000);return Math.max(0,Math.min(1,left/total))}function updateBadgeTimers(){const deg=`${Math.round(timerProgress()*360)}deg`;document.querySelectorAll(".badge.active").forEach(b=>b.style.setProperty("--timer-deg",deg))}function updateClock(){if(!latest||!latest.state){els.clock.textContent="";updateBadgeTimers();return}const s=latest.state;if(!clockDeadline){els.clock.textContent=s.timeLeft!==null?`Clock: ${s.timeLeft}s`:"";updateBadgeTimers();return}const left=Math.max(0,Math.ceil((clockDeadline-Date.now())/1000));els.clock.textContent=`Clock: ${left}s`;updateBadgeTimers();if(left<=0&&Date.now()-timeoutSentAt>2500){timeoutSentAt=Date.now();send("timeout_fold")}}
 function playerNameTag(player, you, color, size) {
   const style = "color:" + color + ";--name-size:" + size;
