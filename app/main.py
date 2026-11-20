@@ -2915,6 +2915,9 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 
 .table-stage{grid-area:2/1;container-type:size;min-width:0;min-height:0;display:grid;place-items:center}
 .table-shell{width:min(1180px,100cqw,calc(100cqh * 1180 / 650));min-width:0;max-width:100%;margin:0}
+@media (min-width:761px){
+  .table-shell{transform:translateY(min(0px,max(-34%,calc(50% - 50cqh + 32px))))}
+}
 .seats{inset:3% 8% 3.5%}
 @container (max-height:680px){
   .seats{inset-block:5%}
