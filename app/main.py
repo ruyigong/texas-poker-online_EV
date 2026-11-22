@@ -3087,7 +3087,9 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .tomato-players th,.tomato-players td{padding:5px 3px;overflow-wrap:anywhere;border-bottom:1px solid #263448}
 .tomato-players thead{color:var(--muted)}
 .tomato-players tbody th{color:#d8ecff}
-.tomato-players td,.tomato-players thead th:not(:first-child){width:7ch;text-align:right;font-variant-numeric:tabular-nums}
+.tomato-players td,.tomato-players thead th:not(:first-child){text-align:center;white-space:nowrap;overflow-wrap:normal;font-variant-numeric:tabular-nums}
+.tomato-players thead th:not(:first-child){width:60px}
+@container (min-width:235px){.tomato-players thead th:not(:first-child){width:28%}}
 .tomato-pairs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:8px}
 .tomato-pair{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .tomato-pair>span{min-width:0}
