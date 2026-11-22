@@ -3065,10 +3065,17 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .score-player .bot-remove-btn{flex:none;width:auto}
 #roomVideoFrame iframe{min-height:0}
 
-.actions{grid-area:3/1;width:min(100%,1050px);margin:0 auto;padding:6px;gap:5px;
+.actions-dock{grid-area:3/1;min-width:0}
+.actions{position:relative;width:min(100%,1050px);margin:0 auto;padding:6px 34px 6px 6px;gap:5px;
   grid-template-columns:repeat(9,minmax(0,1fr))}
 .actions button,.actions input{height:auto;min-height:34px;min-width:0;padding:5px 3px;
   font-size:clamp(11px,1.12vw,14px);white-space:normal;overflow-wrap:anywhere}
+.actions.is-floating{position:fixed;z-index:19;margin:0}
+.actions .betting-handle,.actions .betting-reset{position:absolute;right:5px;width:24px;height:24px;
+  min-height:0;padding:0;border-radius:50%;font-size:15px;background:#182233;color:#d8ecff;border:1px solid #52627a}
+.betting-handle{top:5px;cursor:grab;touch-action:none}
+.betting-handle:active{cursor:grabbing}
+.betting-reset{top:32px}
 .actions #raiseAmount{min-width:0;font-size:12px}
 .quick-bet-row{grid-template-columns:repeat(8,minmax(0,1fr));gap:5px}
 .quick-bet-row button{min-height:28px}
@@ -3209,7 +3216,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
   <p id="roomVideoStatus" role="status" hidden></p>
   <a id="openVideoOnYouTube" target="_blank" rel="noopener noreferrer" hidden>Open on YouTube</a>
 </section><section id="squidStatus" class="squid-status-panel hidden"></section><section id="scoreboardPanel" class="scoreboard-panel"><b>Win / Lose</b><div id="scoreboardRows" class="score-table"></div></section>
-</div></section><section class="actions" aria-label="Betting and refill"><button id="prefold" class="ghost action-wrap" title="This round only. Check if free, fold if facing a bet.">Check /<br>Fold</button><button id="fold" class="ghost">Fold</button><button id="check" class="ghost">Check</button><button id="call">Call</button><button id="allIn" class="ghost">All-In</button><button id="noStraddle" class="ghost">No Straddle</button><button id="straddle">Straddle</button><input id="raiseAmount" type="number" min="1" placeholder="Enter for raise"><button id="raise">Raise</button><div class="quick-bet-row"><button class="quick-bet" data-pot-percent="0.1" type="button">10%</button><button class="quick-bet" data-pot-percent="0.25" type="button">25%</button><button class="quick-bet" data-pot-percent="0.4" type="button">40%</button><button class="quick-bet" data-pot-percent="0.5" type="button">50%</button><button class="quick-bet" data-pot-percent="0.75" type="button">75%</button><button class="quick-bet" data-pot-percent="1" type="button">100%</button><button class="quick-bet" data-pot-percent="1.5" type="button">150%</button><button class="quick-bet" data-pot-percent="2" type="button">200%</button></div><div id="rebuyPanel" class="rebuy-panel hidden"><div class="refill-label"><label for="rebuyUnits">Refill</label><small id="refillBuyInHint"></small></div><input id="rebuyUnits" aria-describedby="refillBuyInHint" type="number" value="0" step="1"><button id="rebuy">Apply Refill</button></div></section><button id="drawerBackdrop" class="drawer-backdrop" type="button" tabindex="-1" aria-label="Close drawer"></button><div id="allInConfirm" class="action-confirm hidden"><div class="panel"><h2>Lovely action!</h2><div class="panel-sub">But you're sure to all-in?</div><div class="prompt-actions"><button id="allInCancel" class="link-btn mini">Cancel</button><button id="allInConfirmBtn" class="mini">All-In</button></div></div></div></main></div><script src="/table-audio.js"></script><script src="/table-updates.js"></script>
+</div></section><div id="actionsDock" class="actions-dock"><section class="actions" aria-label="Betting and refill"><button id="bettingHandle" class="betting-handle" type="button" aria-label="Move betting and refill bar" title="Drag to move, or use the arrow keys">+</button><button id="bettingReset" class="betting-reset hidden" type="button" aria-label="Reset betting bar position" title="Reset betting bar position">&#8634;</button><button id="prefold" class="ghost action-wrap" title="This round only. Check if free, fold if facing a bet.">Check /<br>Fold</button><button id="fold" class="ghost">Fold</button><button id="check" class="ghost">Check</button><button id="call">Call</button><button id="allIn" class="ghost">All-In</button><button id="noStraddle" class="ghost">No Straddle</button><button id="straddle">Straddle</button><input id="raiseAmount" type="number" min="1" placeholder="Enter for raise"><button id="raise">Raise</button><div class="quick-bet-row"><button class="quick-bet" data-pot-percent="0.1" type="button">10%</button><button class="quick-bet" data-pot-percent="0.25" type="button">25%</button><button class="quick-bet" data-pot-percent="0.4" type="button">40%</button><button class="quick-bet" data-pot-percent="0.5" type="button">50%</button><button class="quick-bet" data-pot-percent="0.75" type="button">75%</button><button class="quick-bet" data-pot-percent="1" type="button">100%</button><button class="quick-bet" data-pot-percent="1.5" type="button">150%</button><button class="quick-bet" data-pot-percent="2" type="button">200%</button></div><div id="rebuyPanel" class="rebuy-panel hidden"><div class="refill-label"><label for="rebuyUnits">Refill</label><small id="refillBuyInHint"></small></div><input id="rebuyUnits" aria-describedby="refillBuyInHint" type="number" value="0" step="1"><button id="rebuy">Apply Refill</button></div></section></div><button id="drawerBackdrop" class="drawer-backdrop" type="button" tabindex="-1" aria-label="Close drawer"></button><div id="allInConfirm" class="action-confirm hidden"><div class="panel"><h2>Lovely action!</h2><div class="panel-sub">But you're sure to all-in?</div><div class="prompt-actions"><button id="allInCancel" class="link-btn mini">Cancel</button><button id="allInConfirmBtn" class="mini">All-In</button></div></div></div></main></div><script src="/table-audio.js"></script><script src="/table-updates.js"></script>
 <script>
 const $=id=>document.getElementById(id),els={loginPage:$("loginPage"),lobbyPage:$("lobbyPage"),gamePage:$("gamePage"),sidebarToggle:$("sidebarToggle"),loginName:$("loginName"),loginPassword:$("loginPassword"),inviteCode:$("inviteCode"),loginBtn:$("loginBtn"),loginNotice:$("loginNotice"),lobbyUser:$("lobbyUser"),logoutBtn:$("logoutBtn"),newRoomName:$("newRoomName"),newRoomPassword:$("newRoomPassword"),createLobbyRoom:$("createLobbyRoom"),lobbyNotice:$("lobbyNotice"),joinPrompt:$("joinPrompt"),joinPromptRoom:$("joinPromptRoom"),joinPromptPassword:$("joinPromptPassword"),cancelJoinPrompt:$("cancelJoinPrompt"),confirmJoinPrompt:$("confirmJoinPrompt"),refreshRooms:$("refreshRooms"),roomList:$("roomList"),backLobby:$("backLobby"),name:$("name"),playerPassword:$("playerPassword"),roomPassword:$("roomPassword"),create:$("create"),roomCode:$("roomCode"),join:$("join"),joinSeat:$("joinSeat"),startHand:$("startHand"),shuffleSeats:$("shuffleSeats"),smallBlind:$("smallBlind"),bigBlind:$("bigBlind"),chipsPerBuyIn:$("chipsPerBuyIn"),actionTimeout:$("actionTimeout"),buyTimeSeconds:$("buyTimeSeconds"),peekPriceMin:$("peekPriceMin"),peekPriceMax:$("peekPriceMax"),peekToggle:$("peekToggle"),worshipToggle:$("worshipToggle"),setBlinds:$("setBlinds"),addBot:$("addBot"),squidTotal:$("squidTotal"),squidPrice:$("squidPrice"),foldSquid:$("foldSquid"),setSquid:$("setSquid"),meta:$("meta"),pokerGod:$("pokerGod"),pokerGodChips:$("pokerGodChips"),chatPanel:$("chatPanel"),chatMessages:$("chatMessages"),chatInput:$("chatInput"),chatSend:$("chatSend"),topbar:$("topbar"),tableShell:$("tableShell"),chipFlightLayer:$("chipFlightLayer"),seats:$("seats"),board:$("board"),potLabel:$("potLabel"),clock:$("clock"),tableNotice:$("tableNotice"),centerReadyHost:$("centerReadyHost"),boardChoiceHint:$("boardChoiceHint"),squidStatus:$("squidStatus"),scoreboardPanel:$("scoreboardPanel"),peekSummary:$("peekSummary"),worshipSummary:$("worshipSummary"),previousHands:$("previousHands"),historyList:$("historyList"),historyPanel:$("historyPanel"),buyTime:$("buyTime"),showEndedHand:$("showEndedHand"),hand:$("hand"),notice:$("notice"),prefold:$("prefold"),fold:$("fold"),check:$("check"),call:$("call"),allIn:$("allIn"),noStraddle:$("noStraddle"),straddle:$("straddle"),raiseAmount:$("raiseAmount"),raise:$("raise"),rebuyPanel:$("rebuyPanel"),readyNext:$("readyNext"),rebuyUnits:$("rebuyUnits"),refillBuyInHint:$("refillBuyInHint"),rebuy:$("rebuy"),allInConfirm:$("allInConfirm"),allInCancel:$("allInCancel"),allInConfirmBtn:$("allInConfirmBtn")};
 const playerColors=["#7dd3fc","#fda4af","#86efac","#c4b5fd","#fb923c","#5eead4","#f0abfc","#93c5fd","#f472b6","#a78bfa"];const suitMap={S:"\u2660",H:"\u2665",D:"\u2666",C:"\u2663"},seatPositions=[[53,97],[14,81],[8,53],[14,25],[33,9],[53,9],[73,9],[92,25],[97,53],[92,81]],
@@ -3387,7 +3394,88 @@ const settingsPanel = $("settingsPanel");
 const panelsToggle = $("panelsToggle");
 const tableStage = $("tableStage");
 const topBar = els.gamePage.querySelector(".topbar");
-const actions = els.gamePage.querySelector(".actions");
+const actionsDock = $("actionsDock");
+const actions = actionsDock.querySelector(".actions");
+const bettingHandle = $("bettingHandle");
+const bettingReset = $("bettingReset");
+const bettingPositionKey = "pokerBettingPosition";
+let bettingPosition = null;
+let bettingDrag = null;
+
+try {
+  const saved = JSON.parse(localStorage.getItem(bettingPositionKey) || "null");
+  if (Number.isFinite(saved?.left) && Number.isFinite(saved?.top)) bettingPosition = saved;
+} catch {}
+
+function positionBettingBar() {
+  if (!bettingPosition || !actionsDock.clientWidth) return;
+  actions.classList.add("is-floating");
+  bettingReset.classList.remove("hidden");
+  actions.style.width = Math.min(actionsDock.getBoundingClientRect().width, 1050) + "px";
+  const {width, height} = actions.getBoundingClientRect();
+  actionsDock.style.minHeight = height + "px";
+
+  const inset = 5;
+  const right = Math.max(inset, document.documentElement.clientWidth - width - inset);
+  const bottom = Math.max(inset, document.documentElement.clientHeight - height - inset);
+  actions.style.left = Math.min(Math.max(inset, bettingPosition.left), right) + "px";
+  actions.style.top = Math.min(Math.max(inset, bettingPosition.top), bottom) + "px";
+}
+
+function saveBettingPosition() {
+  const {left, top} = actions.getBoundingClientRect();
+  bettingPosition = {left, top};
+  try {
+    localStorage.setItem(bettingPositionKey, JSON.stringify(bettingPosition));
+  } catch {}
+}
+
+function resetBettingPosition() {
+  bettingPosition = null;
+  actions.classList.remove("is-floating");
+  bettingReset.classList.add("hidden");
+  actions.style.left = actions.style.top = actions.style.width = "";
+  actionsDock.style.minHeight = "";
+  try {
+    localStorage.removeItem(bettingPositionKey);
+  } catch {}
+  bettingHandle.focus();
+}
+
+bettingHandle.addEventListener("pointerdown", event => {
+  if (event.button !== 0 || !event.isPrimary) return;
+  const {left, top} = actions.getBoundingClientRect();
+  bettingDrag = {left, top, x: event.clientX, y: event.clientY, moved: false};
+  bettingHandle.setPointerCapture(event.pointerId);
+});
+bettingHandle.addEventListener("pointermove", event => {
+  if (!bettingDrag || !bettingHandle.hasPointerCapture(event.pointerId)) return;
+  const dx = event.clientX - bettingDrag.x, dy = event.clientY - bettingDrag.y;
+  if (!bettingDrag.moved && Math.hypot(dx, dy) < 5) return;
+  bettingDrag.moved = true;
+  bettingPosition = {left: bettingDrag.left + dx, top: bettingDrag.top + dy};
+  positionBettingBar();
+});
+bettingHandle.addEventListener("lostpointercapture", () => {
+  if (bettingDrag?.moved) saveBettingPosition();
+  bettingDrag = null;
+});
+bettingHandle.addEventListener("keydown", event => {
+  const offsets = {ArrowLeft: [-12, 0], ArrowRight: [12, 0], ArrowUp: [0, -12], ArrowDown: [0, 12]};
+  const offset = offsets[event.key];
+  if (!Array.isArray(offset)) return;
+  event.preventDefault();
+  const {left, top} = actions.getBoundingClientRect();
+  bettingPosition = {left: left + offset[0], top: top + offset[1]};
+  positionBettingBar();
+  saveBettingPosition();
+});
+bettingHandle.addEventListener("dblclick", resetBettingPosition);
+bettingReset.addEventListener("click", resetBettingPosition);
+const bettingResize = new ResizeObserver(positionBettingBar);
+bettingResize.observe(actionsDock);
+bettingResize.observe(actions);
+window.addEventListener("resize", positionBettingBar);
 const panelButtons = Array.from(panelDrawer.querySelectorAll(".panel-buttons button"), button => ({
   button,
   panel: $(button.getAttribute("aria-controls"))
