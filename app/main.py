@@ -306,12 +306,18 @@ class Player:
     stat_vpip: int = 0
     stat_pfr: int = 0
     is_bot: bool = False
-    tomatoes: int = 66
+    tomatoes: int = 99
+    flowers_toward_tomato: int = 0
     last_throw_at: float = field(default=float("-inf"), init=False)
 
     def award_tomatoes(self, pot_share: int) -> None:
         if pot_share > 0:
-            self.tomatoes += 36 + pot_share * 3 // 100
+            self.tomatoes += 36 + (pot_share * 3 + 99) // 100
+
+    def record_flower(self) -> bool:
+        bonus, self.flowers_toward_tomato = divmod(self.flowers_toward_tomato + 1, 10)
+        self.tomatoes += bonus
+        return bool(bonus)
 
     def can_act(self) -> bool:
         return not self.is_spectator and not self.folded and not self.all_in and self.chips > 0 and bool(self.cards)
@@ -589,7 +595,7 @@ class Room:
         if persist:
             self.write_hand_history(completed=self.stage == "showdown")
 
-    def log_action(self, player: Player, action: str, amount: int = 0, note: str = "", thinking_time: float | None = None, stack_before: int | None = None, stack_after: int | None = None, cards: list[str] | None = None) -> None:
+    def log_action(self, player: Player, action: str, amount: int = 0, note: str = "", thinking_time: float | None = None, stack_before: int | None = None, stack_after: int | None = None, cards: list[str] | None = None, *, persist: bool = True) -> None:
         entry = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "stage": self.stage,
@@ -605,7 +611,7 @@ class Room:
         }
         if cards is not None:
             entry["cards"] = cards
-        self.append_history_entry(entry)
+        self.append_history_entry(entry, persist=persist)
 
     def log_system_action(self, action: str, note: str = "", cards: list[str] | None = None) -> None:
         entry = {
@@ -767,7 +773,19 @@ class Room:
         self.message = f"{giver.name} worships {target.name} {amount}."
         return None
 
+    def award_non_winners_tomatoes(self) -> None:
+        winner_ids = {winner["id"] for winner in self.winners if winner["amount"] > 0}
+        returned: Counter[str] = Counter()
+        for entry in self.action_log:
+            if entry.get("action") == "return":
+                returned[entry["playerId"]] += entry["amount"]
+        for player in self.seated_players():
+            if player.id not in winner_ids:
+                invested = max(0, player.total_bet - returned[player.id])
+                player.tomatoes += (invested + 9) // 10
+
     def log_result(self) -> None:
+        self.award_non_winners_tomatoes()
         if not self.winners:
             return
         summary = "; ".join(f"{winner['name']} wins {winner['amount']}" for winner in self.winners if winner.get("amount", 0) > 0)
@@ -783,6 +801,8 @@ class Room:
             "note": "hand complete",
             "stackBefore": None,
             "stackAfter": None,
+            "winners": self.winners,
+            "stacks": self.hand_stack_summary(),
         }
         showdown = self.showdown_history()
         if showdown:
@@ -923,6 +943,7 @@ class Room:
         return {
             "roomCode": self.code,
             "roomName": self.name or self.code,
+            "handId": self.hand_id,
             "stage": self.stage,
             "bettingRound": self.betting_round,
             "pot": self.pot,
@@ -962,8 +983,9 @@ class Room:
             "message": self.message,
             "winners": self.winners,
             "handHistory": [
-                {**entry, "showdown": self.showdown_history()}
-                if entry.get("stage") == "result" and "showdown" not in entry and self.showdown_order
+                {**entry, "showdown": self.showdown_history(), "winners": self.winners,
+                 "stacks": self.hand_stack_summary()}
+                if entry.get("stage") == "result" and "stacks" not in entry
                 else entry
                 for entry in self.action_log[-80:]
             ],
@@ -991,6 +1013,7 @@ class Room:
                     "id": player.id,
                     "name": player.name,
                     "chips": player.chips,
+                    "tomatoes": player.tomatoes,
                     "connected": player.connected,
                     "isSpectator": player.is_spectator,
                     "wantsSeat": player.wants_seat,
@@ -1881,7 +1904,6 @@ class Room:
             "bb": big_blind_player.id,
         }
         self.begin_hand_history()
-        self.write_hand_history(completed=False)
         self.contribute(small_blind_player, self.small_blind)
         self.contribute(big_blind_player, self.big_blind)
         self.current_bet = max(player.current_bet for player in players)
@@ -1906,7 +1928,7 @@ class Room:
         self.board_choice_max = 1
         self.board_base_count = 0
         self.run_board_count = 1
-        self.log_action(small_blind_player, "small blind", small_blind_player.current_bet, thinking_time=0.0, stack_before=small_blind_player.chips + small_blind_player.current_bet, stack_after=small_blind_player.chips)
+        self.log_action(small_blind_player, "small blind", small_blind_player.current_bet, thinking_time=0.0, stack_before=small_blind_player.chips + small_blind_player.current_bet, stack_after=small_blind_player.chips, persist=False)
         self.log_action(big_blind_player, "big blind", big_blind_player.current_bet, thinking_time=0.0, stack_before=big_blind_player.chips + big_blind_player.current_bet, stack_after=big_blind_player.chips)
         self.start_action_clock()
         self.message = f"{players[self.straddle_index].name} may straddle to {self.straddle_amount}." + squid_note
@@ -1975,12 +1997,14 @@ class Room:
             return "It is not your turn."
         player = self.players[player_id]
         call_amount = max(0, self.current_bet - player.current_bet)
+        if action == "raise" and amount < self.current_bet + self.min_raise:
+            return f"Raise must be at least {self.current_bet + self.min_raise} total."
+        if action == "check" and call_amount > 0:
+            return f"Call {call_amount} or fold."
         player.prefold_round = None
         if action == "fold":
             self.fold_player(player)
         elif action == "check":
-            if call_amount > 0:
-                return f"Call {call_amount} or fold."
             self.check_player(player)
         elif action == "call":
             paid = self.contribute(player, call_amount)
@@ -2005,13 +2029,7 @@ class Room:
                         other.acted = other.id == player.id or not other.can_act()
             self.message = f"{player.name} is all-in for {paid}."
         elif action == "raise":
-            min_raise_to = self.current_bet + self.min_raise
-            if amount < min_raise_to:
-                return f"Raise must be at least {min_raise_to} total."
-            raise_to = amount
-            extra = raise_to - player.current_bet
-            if extra <= call_amount:
-                return f"Raise must be at least {min_raise_to} total."
+            extra = amount - player.current_bet
             old_bet = self.current_bet
             paid = self.contribute(player, extra)
             player.checked_marker = False
@@ -2541,14 +2559,19 @@ class RoomManager:
         await self.broadcast_state(room)
 
     async def broadcast(self, room: Room, payload: dict[str, Any]) -> None:
-        disconnected = False
-        for player_id, socket in list(room.sockets.items()):
+        message = json.dumps(payload, separators=(",", ":"))
+
+        async def send_event(player_id: str, socket: WebSocket) -> bool:
             try:
-                await socket.send_text(json.dumps(payload, separators=(",", ":")))
+                await socket.send_text(message)
             except Exception:
-                if self.mark_disconnected(room, player_id, socket):
-                    disconnected = True
-        if disconnected:
+                return self.mark_disconnected(room, player_id, socket)
+            return False
+
+        disconnected = await asyncio.gather(
+            *(send_event(player_id, socket) for player_id, socket in room.sockets.items())
+        )
+        if any(disconnected):
             self.persist_room(room)
 
     async def send_table_state(self, room: Room, player_id: str, socket: WebSocket, force: bool = False) -> None:
@@ -2582,15 +2605,18 @@ class RoomManager:
             stream.revision = revision
 
     async def broadcast_state(self, room: Room) -> None:
+        async def send_state(player_id: str, socket: WebSocket) -> bool:
+            try:
+                await self.send_table_state(room, player_id, socket)
+            except Exception:
+                return self.mark_disconnected(room, player_id, socket)
+            return False
+
         while True:
-            disconnected = False
-            for player_id, socket in list(room.sockets.items()):
-                try:
-                    await self.send_table_state(room, player_id, socket)
-                except Exception:
-                    if self.mark_disconnected(room, player_id, socket):
-                        disconnected = True
-            if not disconnected:
+            disconnected = await asyncio.gather(
+                *(send_state(player_id, socket) for player_id, socket in room.sockets.items())
+            )
+            if not any(disconnected):
                 return
             self.persist_room(room)
 
@@ -2947,10 +2973,14 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
                 ):
                     if action == "throw_flower":
                         player.last_throw_at = now
+                        earned_tomato = player.record_flower()
+                        manager.persist_room(room)
                         await manager.broadcast(room, {
                             "type": "flower", "fromId": player.id, "fromName": player.name,
                             "targetId": target.id, "targetName": target.name,
                         })
+                        if earned_tomato:
+                            await manager.broadcast_state(room)
                     else:
                         result = room.record_tomato(player, target)
                         if result is None:
@@ -2959,10 +2989,13 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
                         player.last_throw_at = now
                         manager.persist_room(room)
                         await manager.broadcast(room, {"type": "tomato", **result})
-                        await manager.send_table_state(room, player_id, websocket)
+                        await manager.broadcast_state(room)
                 continue
             if action == "start_hand":
-                room.reset_hand()
+                error = ("Spectators cannot start the next hand." if player.is_spectator
+                         else room.start_blocked_reason())
+                if not error:
+                    room.reset_hand()
             elif action in {"fold", "check", "call", "raise", "all_in"}:
                 try:
                     amount = int(message.get("amount", 0))
@@ -3057,10 +3090,10 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
             elif action == "request_seat":
                 error = room.request_seat(player_id)
             if error:
-                await manager.broadcast(room, {"type": "error", "message": error})
-            else:
-                room.drive_bots()
-                manager.persist_room(room)
+                await websocket.send_json({"type": "error", "message": error})
+                continue
+            room.drive_bots()
+            manager.persist_room(room)
             await manager.broadcast_state(room)
     except WebSocketDisconnect:
         await manager.disconnect(room, player_id, websocket)
@@ -3200,7 +3233,9 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .panel-slots .chat-panel{position:relative;inset:auto;height:auto}
 .panel-slots .history-list,.panel-slots .peek-summary{flex:1;min-height:0;max-height:none}
 .panel-slots .previous-hands{max-height:40%;flex:none}
-.panel-slots .chat-row,.panel-slots .history-winners{color:#86efac;font-weight:900;margin-top:3px}
+.panel-slots .chat-row,.panel-slots .history-pot,.history-stack-gain{color:#86efac;font-weight:900}
+.history-stack-loss{color:#fda4af}
+.hand-result{display:grid;gap:3px;overflow-wrap:anywhere}
 .history-row,.panel-slots .peek-row,.panel-slots .squid-status-panel{overflow-wrap:anywhere}
 .tomato-section-title{margin:0;color:#d8ecff;font-size:13px}
 .tomato-players{width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px;text-align:left}
@@ -3208,8 +3243,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
 .tomato-players thead{color:var(--muted)}
 .tomato-players tbody th{color:#d8ecff}
 .tomato-players td,.tomato-players thead th:not(:first-child){text-align:center;white-space:nowrap;overflow-wrap:normal;font-variant-numeric:tabular-nums}
-.tomato-players thead th:not(:first-child){width:60px}
-@container (min-width:235px){.tomato-players thead th:not(:first-child){width:28%}}
+.tomato-players thead th:not(:first-child){width:20%;white-space:normal;overflow-wrap:anywhere}
 .tomato-pairs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:8px}
 .tomato-pair{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .tomato-pair>span{min-width:0}
@@ -3363,7 +3397,7 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
     <input id="effectsVolume" type="range" min="0" max="100" value="100">
     <output id="effectsVolumeValue" for="effectsVolume">100%</output>
   </div>
-</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels">
+</div><div id="topbar"></div></div><div id="tableStage" class="table-stage"><section id="tableShell" class="table-shell"><div class="table"></div><div id="chipFlightLayer" class="chip-flight-layer"></div><div id="seats" class="seats"></div><div id="board" class="board"></div><div class="pot"><div id="potLabel" class="pot-label">Total Pot: 0</div><div class="chips"><span class="chip green"></span><span class="chip red"></span><span class="chip gold"></span><span class="chip blue"></span></div><div id="clock" class="clock"></div></div><div id="tableNotice" class="table-notice" aria-live="polite"></div><div id="centerReadyHost" class="center-ready-host hidden"><button id="readyNext" class="ghost">Ready</button></div><div id="boardChoiceHint" class="board-choice-hint hidden"></div><div class="player-view"><button id="buyTime" class="buy-time hidden">Buy Time</button><div class="self-hand-row"><div id="hand" class="hand"></div><button id="showEndedHand" class="buy-time show-hand-side hidden">Show Hand</button></div><div id="notice" class="notice" role="status"></div></div></section></div><section id="panelDrawer" class="side-stack" aria-label="Table panels">
 <div id="sidebarResize" class="sidebar-resize" role="separator" tabindex="0" aria-orientation="vertical"
   aria-label="Resize right sidebar" aria-controls="panelDrawerContent" aria-valuenow="0"
   title="Drag to resize. Double-click to reset."><span aria-hidden="true">⋮</span></div>
@@ -3386,8 +3420,8 @@ button.pname[data-throw-tomato]:focus-visible{outline:2px solid #ff8269;outline-
     <div class="peek-row"><b>Total tomatoes</b> <span id="tomatoTotal">0</span></div>
     <h3 id="tomatoPlayersTitle" class="tomato-section-title">By player</h3>
     <table class="tomato-players" aria-labelledby="tomatoPlayersTitle">
-      <thead><tr><th scope="col">Player</th><th scope="col">Thrown</th><th scope="col">Received</th></tr></thead>
-      <tbody id="tomatoPlayerRows"><tr><td colspan="3">No players yet.</td></tr></tbody>
+      <thead><tr><th scope="col">Player</th><th scope="col">Thrown</th><th scope="col">Received</th><th scope="col">Owned</th></tr></thead>
+      <tbody id="tomatoPlayerRows"><tr><td colspan="4">No players yet.</td></tr></tbody>
     </table>
     <h3 class="tomato-section-title">Throw details</h3>
     <div id="tomatoPairs" class="tomato-pairs"><div class="history-empty">No tomatoes thrown yet.</div></div>
@@ -3412,7 +3446,27 @@ compactSeatPositions=[[50,93],[11,81],[11,58],[11,34],[20,12],[50,12],[80,12],[8
 let roomCode=roomCodeFromPath()||localStorage.getItem("roomCode")||"",playerId=localStorage.getItem("playerId")||sessionStorage.getItem("playerId")||"",ws=null,latest=null,timeoutSentAt=0,clockDeadline=0,creatingRoom=false,joiningRoom=false,pendingJoinRoomCode="",settingsDirty=false,appliedSettingsKey="",squidSettingsDirty=false,appliedSquidKey="",lastSoundCount=0,lastWinnerKey="";const playSound=tableAudio.playEffect;if(roomCode)els.roomCode.value=roomCode;els.join.disabled=false;
 function roomCodeFromPath(){const match=location.pathname.match(new RegExp("^/room/([^/]+)$"));return match?decodeURIComponent(match[1]).toUpperCase():""}function setPath(path){if(location.pathname!==path)history.pushState(null,"",path)}function settingsKey(){return `${els.smallBlind.value}|${els.bigBlind.value}|${els.chipsPerBuyIn.value}|${els.actionTimeout.value}|${els.buyTimeSeconds.value}|${els.peekPriceMin.value}|${els.peekPriceMax.value}`}function squidKey(){return `${els.squidTotal.value}|${els.squidPrice.value}|${els.foldSquid.checked}`}function updateSettingsButton(unlocked=true){els.setBlinds.disabled=!unlocked||!settingsDirty}function updateSquidButton(unlocked=true,restartable=false){els.setSquid.disabled=!restartable&&(!unlocked||!squidSettingsDirty)}function authName(){return localStorage.getItem("authName")||""}function authPassword(){return localStorage.getItem("authPassword")||""}function setIdentity(){els.name.value=authName();els.playerPassword.value=authPassword();els.lobbyUser.textContent=authName()?`Signed in as ${authName()}`:""}function showLogin(){tableAudio.reset();setPath("/");els.loginPage.classList.remove("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers()}function showLobby(){tableAudio.reset();setPath("/lobby");setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.remove("hidden");els.gamePage.classList.add("hidden");closeJoinPrompt();closeDrawers();loadRooms()}function showGame(){if(roomCode)setPath(`/room/${encodeURIComponent(roomCode)}`);setIdentity();els.loginPage.classList.add("hidden");els.lobbyPage.classList.add("hidden");els.gamePage.classList.remove("hidden");closeJoinPrompt()}function openJoinPrompt(code,name,locked){pendingJoinRoomCode=code;els.joinPromptRoom.textContent=`${name||code} ${locked?"requires a room password.":"does not require a room password."}`;els.joinPromptPassword.value="";els.joinPromptPassword.placeholder=locked?"Room password":"Room password (optional)";els.joinPrompt.classList.remove("hidden");setTimeout(()=>els.joinPromptPassword.focus(),0)}function closeJoinPrompt(){pendingJoinRoomCode="";if(els.joinPrompt)els.joinPrompt.classList.add("hidden")}async function loadRooms(){try{const res=await fetch("/rooms"),data=await res.json(),rooms=data.rooms||[];els.roomList.innerHTML=rooms.length?rooms.map(r=>`<div class="room-row"><div><div class="room-name">${esc(r.name)} ${r.hasPassword?"[Locked]":""}</div><div class="room-meta">${String(r.stage).toUpperCase()} | Seats ${r.players}/${r.maxSeats}</div></div><button class="mini" data-room="${r.roomCode}" data-name="${esc(r.name)}" data-locked="${r.hasPassword?1:0}">Join</button><button class="mini danger-mini" data-delete-room="${r.roomCode}" data-name="${esc(r.name)}" ${r.canDelete?"":"disabled"} title="${r.canDelete?"Delete room":"Only when everyone is disconnected"}">Delete</button></div>`).join(""):`<div class="history-empty">No rooms yet.</div>`;els.roomList.querySelectorAll("button[data-room]").forEach(btn=>btn.onclick=()=>openJoinPrompt(btn.dataset.room,btn.dataset.name,btn.dataset.locked==="1"));els.roomList.querySelectorAll("button[data-delete-room]").forEach(btn=>btn.onclick=()=>deleteLobbyRoom(btn.dataset.deleteRoom,btn.dataset.name));}catch(err){els.roomList.innerHTML=`<div class="history-empty">Could not load rooms.</div>`}}async function deleteLobbyRoom(code,name){if(!code)return;if(!confirm(`Delete room ${name||code}?`))return;try{const res=await fetch(`/rooms/${encodeURIComponent(code)}`,{method:"DELETE"}),data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.error||"Could not delete room");els.lobbyNotice.textContent=`Deleted room ${name||code}.`;loadRooms()}catch(err){els.lobbyNotice.textContent=err.message||"Could not delete room"}}async function createLobbyRoom(){if(!authName()){showLogin();return}try{els.lobbyNotice.textContent="Creating room...";const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),roomName:els.newRoomName.value||"",password:els.newRoomPassword.value||""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not create room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=els.newRoomPassword.value||"";showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not create room"}}async function joinLobbyRoom(code,password=""){if(!authName()){showLogin();return}try{const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:authName(),playerPassword:authPassword(),password:password||"",playerId:code===roomCode?(playerId||""):""})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not join room");roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.roomPassword.value=password||"";closeJoinPrompt();showGame();connect()}catch(err){els.lobbyNotice.textContent=err.message||"Could not join room"}}
 function cardEl(card,small=false){if(!card)return `<div class="card back ${small?"small":""}"></div>`;const suit=card.slice(-1),rank=card.slice(0,-1),sym=suitMap[suit]||suit;return `<div class="card ${small?"small":""}"><div class="corner suit-${suit}">${rank}<br>${sym}</div><div class="suit-big suit-${suit}">${sym}</div></div>`}
-function send(action,extra={}){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({action,...extra}))}
+function send(action, extra = {}) {
+  if (ws?.readyState !== WebSocket.OPEN) {
+    els.notice.textContent = "Table connection is unavailable. Reload to reconnect.";
+    return;
+  }
+  els.notice.textContent = "";
+  ws.send(JSON.stringify({action, ...extra}));
+}
+
+function submitRaise() {
+  if (els.raise.disabled) return;
+  const min = Number(els.raiseAmount.min);
+  const max = Number(els.raiseAmount.max);
+  const amount = els.raiseAmount.value === "" && !els.raiseAmount.validity.badInput
+    ? min : els.raiseAmount.valueAsNumber;
+  if (!Number.isInteger(amount) || amount < min || amount > max) {
+    els.notice.textContent = "Enter a whole-chip raise between " + min + " and " + max + ".";
+    return;
+  }
+  send("raise", {amount});
+}
 
 function quickBetTo(percent){if(!latest||!latest.state||!latest.you)return;const s=latest.state,you=latest.you,minRaiseTo=Math.max((s.currentBet||0)+(s.minRaise||s.bigBlind),s.bigBlind),betSize=Math.max(s.minRaise||s.bigBlind,Math.round((s.pot||0)*percent)),maxTo=(you.currentBet||0)+(you.chips||0),target=Math.max(minRaiseTo,(s.currentBet||0)+betSize);els.raiseAmount.value=Math.max(0,Math.min(target,maxTo));}
 function connect() {
@@ -3593,7 +3647,26 @@ function animateThrow({type, fromId, fromName, targetId, targetName}) {
 
 function animateWinnerChips(winners){if(!els.chipFlightLayer||!els.potLabel||!winners.length)return;const shellRect=els.tableShell.getBoundingClientRect(),potRect=els.potLabel.getBoundingClientRect(),sourceX=potRect.left+potRect.width/2-shellRect.left,sourceY=potRect.top+potRect.height/2-shellRect.top;winners.forEach((w,wi)=>{const target=els.seats.querySelector(`[data-player-id="${CSS.escape(w.id)}"] .badge`);if(!target)return;const targetRect=target.getBoundingClientRect(),targetX=targetRect.left+targetRect.width/2-shellRect.left,targetY=targetRect.top+targetRect.height/2-shellRect.top;for(let i=0;i<12;i++){const chip=document.createElement("span");chip.className="flying-chip";chip.style.left=`${sourceX+(i%4-1.5)*6}px`;chip.style.top=`${sourceY+(Math.floor(i/4)-1)*6}px`;chip.style.setProperty("--dx",`${targetX-sourceX+(i%3-1)*16}px`);chip.style.setProperty("--dy",`${targetY-sourceY+(Math.floor(i/3)-1.5)*10}px`);chip.style.animationDelay=`${wi*.16+i*.045}s`;els.chipFlightLayer.appendChild(chip);setTimeout(()=>chip.remove(),3400)}})}
 function tipText(t){return String(t||"").replace(new RegExp("[.]\\s+","g"),"."+String.fromCharCode(10))}function splitSquidText(t){const lines=tipText(t).split(String.fromCharCode(10)),main=[],squid=[];for(const line of lines){(/squid/i.test(line)?squid:main).push(line)}return {main:main.join(String.fromCharCode(10)),squid:squid.join(String.fromCharCode(10))}}function esc(t){return String(t||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}function isNameChar(ch){return /[A-Za-z0-9_-]/.test(ch||"")}function colorNotice(text,colorByName){const items=[["Poker God","#ffe28a"],...Object.entries(colorByName||{})].filter(([name])=>name).sort((a,b)=>b[0].length-a[0].length);let out="",i=0,raw=String(text||"");while(i<raw.length){let hit=null;for(const [name,color] of items){if(raw.slice(i,i+name.length)===name&&!isNameChar(raw[i-1])&&!isNameChar(raw[i+name.length])){hit=[name,color];break}}if(hit){out+=`<span style="color:${hit[1]}">${esc(hit[0])}</span>`;i+=hit[0].length}else{out+=esc(raw[i]);i++}}return out.split(String.fromCharCode(10)).join("<br>")}
-function render(payload){latest=payload;const s=payload.state;updateTomatoSummary(s.tomatoSummary, s.players);const you=payload.you,seatedRaw=s.players.filter(p=>!p.isSpectator).slice(0,s.maxSeats||10),youSeat=seatedRaw.findIndex(p=>p.id===you.id),seated=youSeat>=0?[...seatedRaw.slice(youSeat),...seatedRaw.slice(0,youSeat)]:seatedRaw;const roomLabel=s.roomName||s.roomCode;els.topbar.textContent=roomCode?`Connected to ${roomLabel}${you.isSpectator?" as spectator":""}`:"";els.meta.textContent=`Room ${roomLabel} | ${s.stage.toUpperCase()} | Blinds ${s.smallBlind}/${s.bigBlind} | Clock ${s.actionTimeout}s | Seats ${seated.length}/${s.maxSeats}`;els.potLabel.textContent=`Total Pot: ${s.pot}`;els.pokerGodChips.textContent=s.pokerGodChips||0;clockDeadline=s.actionDeadline?Math.round(s.actionDeadline*1000):0;updateClock();els.notice.textContent="";els.boardChoiceHint.textContent="";els.boardChoiceHint.classList.add("hidden");const messageParts=splitSquidText(s.message||(you.isSpectator?"Spectating.":""));const playerColorByName=Object.fromEntries((s.players||[]).map(p=>[p.name,playerColors[(p.colorIndex||0)%playerColors.length]]));const boardChoiceActive=!!(s.boardChoice&&s.boardChoice.active);els.tableNotice.innerHTML=boardChoiceActive?"":colorNotice(messageParts.main,playerColorByName);if(!boardChoiceActive&&!s.canStartHand&&s.startBlockedReason&&["lobby","showdown"].includes(s.stage)){els.tableNotice.innerHTML+=(els.tableNotice.innerHTML?"<br>":"")+colorNotice(s.startBlockedReason,playerColorByName)}if(boardChoiceActive&&messageParts.main){els.boardChoiceHint.innerHTML=colorNotice(messageParts.main,playerColorByName);els.boardChoiceHint.classList.remove("hidden");}$("tomatoBalance").textContent=you.tomatoes??"—";const history=s.handHistory||[];if(history.length<lastSoundCount)lastSoundCount=0;if(lastSoundCount&&history.length>lastSoundCount){history.slice(lastSoundCount).forEach(h=>{const action=String(h.action||"").toLowerCase();if(action==="check")playSound("check");else if(action==="fold"||action==="timeout fold"||action==="prefold")playSound("fold");else if(action==="buy time")playSound("buyTime");else if(/^(small blind|big blind|call|raise|all-in|call all-in|straddle)$/.test(action))playSound("bet")})}lastSoundCount=history.length;els.historyList.innerHTML=history.length?history.slice().reverse().map(h=>{const color=playerColorByName[h.player]||"#ffe28a",stack=h.stackBefore!==null&&h.stackBefore!==undefined?` <span class="history-stack">(${h.stackBefore} -> ${h.stackAfter})</span>`:"";return `<div class="history-row" style="border-left:4px solid ${color}"><div class="history-main"><b style="color:${color}">${esc(h.player)}</b> ${esc(h.action)}${h.amount?` ${h.amount}`:""}${stack}${showdownHistoryMarkup(h.showdown)}</div><div class="history-sub">${String(h.stage).toUpperCase()} | ${h.thinkingTime}s | ${h.time}</div></div>`}).join(""):`<div class="history-empty">No betting yet.</div>`;const peek=s.peekSummary||{},peekRows=peek.actions||[];els.peekSummary.innerHTML=peekRows.length?`<div class="peek-row"><b>Total</b> ${peek.count||0} peek(s), ${peek.total||0} chips to Poker God</div>`+peekRows.slice().reverse().map(p=>`<div class="peek-row"><b>${esc(p.player)}</b> paid ${p.amount}<br>${esc(p.note)}</div>`).join(""):`<div class="history-empty">No peeks yet.</div>`;const worship=s.worshipSummary||{},worshipRows=worship.actions||[];els.worshipSummary.innerHTML=worshipRows.length?`<div class="peek-row"><b>Total</b> ${worship.count||0} worship(s), ${worship.total||0} chips moved</div>`+worshipRows.slice().reverse().map(w=>{const giverColor=playerColorByName[w.player]||"#f7fbff",targetColor=playerColorByName[w.target]||"#f7fbff",stack=w.stackBefore!==null&&w.stackBefore!==undefined?`<br>${w.stackBefore} -> ${w.stackAfter}`:"";return `<div class="peek-row"><b style="color:${giverColor}">${esc(w.player)}</b> -> <b style="color:${targetColor}">${esc(w.target)}</b> ${w.amount}${stack}</div>`}).join(""):`<div class="history-empty">No worship yet.</div>`;renderScoreboard(s,you,playerColorByName);const chats=s.chatMessages||[];els.chatMessages.innerHTML=chats.length?chats.map(m=>{const chatColor=playerColorByName[m.player]||"#f7fbff";return `<div class="chat-row"><b style="color:${chatColor}">${esc(m.player)}</b> ${esc(m.text)}</div>`}).join(""):`<div class="chat-row">No messages yet.</div>`;els.chatMessages.scrollTop=els.chatMessages.scrollHeight;const prev=s.previousHands||[];els.previousHands.innerHTML=prev.length?prev.slice().reverse().map(h=>{const stacks=(h.stacks||[]).map(p=>`${esc(p.name)} ${p.before} -> ${p.after}`).join(" | ");return `<div class="previous-hand"><b>${(h.winners||[]).map(w=>`${w.name} +${w.amount}`).join(", ")||"No winner"}</b><br>${h.endedAt}${stacks?`<br>${stacks}`:""}${showdownHistoryMarkup(h.showdown)}<br>${h.path||""}</div>`}).join(""):"";if(s.bankrollAudit){els.meta.textContent+=` | Bankroll ${s.bankrollAudit.live}/${s.bankrollAudit.effectiveBuyIns}`;}if(s.squid&&s.squid.active){els.meta.textContent+=` | Squids ${s.squid.claimed}/${s.squid.total} @ ${s.squid.price}`;}const squidActive=!!(s.squid&&s.squid.active),squidBlocks=[];if(squidActive){const holdersRaw=(s.squid.holders||[]).map(h=>`${h.name}: ${h.squids}`).join(" | ")||"None yet",holders=colorNotice(holdersRaw,playerColorByName),pending=s.squid.pendingPlayer?`<br>First claim reserved for: ${colorNotice(s.squid.pendingPlayer,playerColorByName)}`:"";squidBlocks.push(`<b>Squid Status</b><br>Claimed: ${s.squid.claimed} | Unclaimed: ${s.squid.remaining} | Price: ${s.squid.price}${s.squid.foldSquid?" | Fold Squid":""}${pending}<br>Holders: ${holders}`);}if(messageParts.squid){squidBlocks.push(colorNotice(messageParts.squid,playerColorByName));}els.squidStatus.classList.toggle("hidden",!squidBlocks.length);els.squidStatus.innerHTML=squidBlocks.join("<hr>");const hostSettings=!!you.isHost,canConfigureSquid=hostSettings&&!!(s.squid&&s.squid.canConfigure);els.squidTotal.disabled=!canConfigureSquid;els.squidPrice.disabled=!canConfigureSquid;els.foldSquid.disabled=!canConfigureSquid;els.squidTotal.min=s.squid&&s.squid.minimum?s.squid.minimum:0;els.peekToggle.textContent=`Peek: ${s.peekEnabled?"On":"Off"}`;els.peekToggle.disabled=!hostSettings;els.worshipToggle.textContent=`Worship: ${s.worshipEnabled?"On":"Off"}`;els.worshipToggle.disabled=!hostSettings;if(!squidSettingsDirty){els.squidTotal.value=s.squid?s.squid.total:0;els.squidPrice.value=s.squid?s.squid.price:0;els.foldSquid.checked=!!s.squid?.foldSquid;appliedSquidKey=squidKey();}updateSquidButton(canConfigureSquid,hostSettings&&!!(s.squid&&s.squid.canRestart));if(!settingsDirty){els.smallBlind.value=s.smallBlind;els.bigBlind.value=s.bigBlind;els.actionTimeout.value=s.actionTimeout;els.buyTimeSeconds.value=s.buyTimeSeconds||30;els.chipsPerBuyIn.value=s.chipsPerBuyIn||0;els.peekPriceMin.value=s.peekPriceMin||0;els.peekPriceMax.value=s.peekPriceMax||0;appliedSettingsKey=`${s.smallBlind}|${s.bigBlind}|${s.chipsPerBuyIn||1000}|${s.actionTimeout}|${s.buyTimeSeconds||30}|${s.peekPriceMin||0}|${s.peekPriceMax||0}`;}els.bigBlind.min=els.smallBlind.value;els.startHand.disabled=!s.canStartHand;els.shuffleSeats.disabled=!you.canShuffleSeats;els.addBot.disabled=!(hostSettings&&(s.stage==="lobby"||s.stage==="showdown")&&seated.length<(s.maxSeats||10));els.joinSeat.disabled=!you.canRequestSeat;els.joinSeat.textContent=you.wantsSeat?"Seat Requested":"Join Game Next Hand";els.join.disabled=false;const settingsUnlocked=hostSettings&&(s.stage==="lobby"||s.stage==="showdown");updateSettingsButton(settingsUnlocked);els.smallBlind.disabled=!settingsUnlocked;els.bigBlind.disabled=!settingsUnlocked;els.chipsPerBuyIn.disabled=false;els.chipsPerBuyIn.readOnly=false;els.actionTimeout.disabled=!settingsUnlocked;els.buyTimeSeconds.disabled=!settingsUnlocked;els.peekPriceMin.disabled=!settingsUnlocked;els.peekPriceMax.disabled=!settingsUnlocked;els.rebuyPanel.classList.toggle("hidden",!!you.isSpectator);const showCenterReady=!you.isSpectator&&(s.stage==="lobby"||s.stage==="showdown");const readyTurnsToStart=!!you.readyNextHand;els.readyNext.textContent=readyTurnsToStart?"Start Next Hand":"Ready";els.readyNext.classList.toggle("start-mode",readyTurnsToStart);els.readyNext.disabled=readyTurnsToStart?!s.canStartHand:!you.canReady;els.centerReadyHost.classList.toggle("hidden",!showCenterReady);const chipsPerBuyIn=s.chipsPerBuyIn||1000;const refillHint="1 buy-in = "+chipsPerBuyIn.toLocaleString("en-US")+" chips";if(els.refillBuyInHint.textContent!==refillHint)els.refillBuyInHint.textContent=refillHint;const minReturn=Math.max(-Math.floor((you.chips||0)/chipsPerBuyIn),-(you.rebuyUnits||0));els.rebuyUnits.min=minReturn;els.rebuyUnits.placeholder=`Min ${minReturn}`;if(you.refillSubmitted)els.rebuyUnits.value=you.pendingRebuyUnits||0;els.rebuyUnits.disabled=!!you.refillSubmitted;if(Number(els.rebuyUnits.value)<minReturn)els.rebuyUnits.value=minReturn;els.rebuy.textContent=you.refillSubmitted?"Submitted":"Apply Refill";els.rebuy.disabled=!!you.refillSubmitted||!!you.isSpectator;const canChooseBoards=!!you.canChooseBoards,boards=s.communityBoards||[],boardCards=s.communityCards||s.community||[],maxWin=Math.max(0,...(s.winners||[]).map(w=>Number(w.amount)||0)),winnerIds=new Set((s.winners||[]).filter(w=>maxWin>0&&(Number(w.amount)||0)===maxWin).map(w=>w.id)),winnerKey=`${s.handId||""}|${(s.winners||[]).map(w=>`${w.id}:${w.amount}`).join(",")}`;els.board.classList.toggle("multi",boards.length>1);els.board.innerHTML=boards.length>1?boards.map((b,i)=>`<div class="board-row"><span class="board-tag">Board ${i+1}</span>${b.map(c=>cardEl(c)).join("")}</div>`).join(""):(boardCards.length?boardCards:[null,null,null,null,null]).map(c=>cardEl(c)).join("");els.buyTime.classList.toggle("hidden",!you.canAct);els.buyTime.disabled=!you.canBuyTime;els.buyTime.textContent=`Buy Time (${s.buyTimePrice||0})`;els.showEndedHand.classList.toggle("hidden",!you.canShowEndedHand);els.showEndedHand.disabled=!you.canShowEndedHand;els.hand.classList.toggle("folded",!!you.folded);els.hand.innerHTML=((you.cards&&you.cards.length)?you.cards:[null,null]).map(c=>cardEl(c)).join("");els.seats.innerHTML=seated.map((p,i)=>{const pos=seatPositions[i]||[50,50],compact=compactSeatPositions[i]||pos,leftSide=pos[0]<35,rightSide=pos[0]>65,topSide=pos[1]<30,active=p.id===s.currentPlayerId?"active":"",self=p.id===you.id?"self":"",cards=(p.cards||[null,null]).map(c=>cardEl(c,true)).join(""),status=`${p.isBot?"Bot":(p.role||"Online")}${p.folded?" Folded":""}${p.allIn?" All-in":""}${p.connected?"":" Away"}`.trim()||"Online",cardStyle=topSide?"--item-x:34px;--item-y:-44px":leftSide?"--item-x:-56px;--item-y:24px":rightSide?"--item-x:128px;--item-y:24px":"--item-x:34px;--item-y:78px",betSide=pos[1]<15?"toward-bottom":rightSide?"toward-left":"toward-right",color=playerColors[(p.colorIndex||0)%playerColors.length],bet=p.currentBet>0?`<div class="seat-bet ${betSide}"><span class="bet-label"><span class="chip red"></span>${p.currentBet}</span></div>`:(p.checked?`<div class="seat-bet ${betSide}"><span class="check-label"><span class="chip white"></span>Check</span></div>`:"");const canOfferPeek=!!(p.canPeek||(s.peekEnabled&&you.folded&&!you.isSpectator&&p.id!==you.id&&p.cardCount>0&&!p.privatePeek&&["straddle","preflop","flop","turn","river","board_choice","reveal","optional_show"].includes(s.stage))),peek=canOfferPeek?`<button class="peek-btn" data-peek="${p.id}">Peek</button>`:"",botActions=hostSettings&&p.isBot?`<div class="bot-tag-actions">${p.refillSubmitted?`<button class="bot-tag-btn bot-refill-btn" type="button" disabled>Refill set</button>`:`<button class="bot-tag-btn bot-refill-btn" data-refill-bot="${p.id}" type="button">Refill</button>`}${["lobby","showdown"].includes(s.stage)?`<button class="bot-tag-btn bot-remove-btn" data-remove-bot="${p.id}" type="button">Remove</button>`:""}</div>`:"",worship=(s.worshipEnabled&&!you.isSpectator&&p.id!==you.id&&!p.isSpectator)?`<button class="worship-btn" data-worship="${p.id}" title="Worship chips">W</button>`:"",burst=winnerIds.has(p.id)?`<div class="winner-burst"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>`:"",boardChoice=p.id===you.id&&canChooseBoards?`<div class="board-choice-pop">${[1,2,3,4].map(n=>`<button data-board-choice="${n}" ${n>(you.boardChoiceMax||s.boardChoice?.max||1)?"disabled":""}>${n}</button>`).join("")}</div>`:"";const roleFrame=seatRoleFrame(p.id,s.seatTokens);return `<div class="seat ${self} ${p.folded?"folded":""}" style="--seat-x:${pos[0]}%;--seat-y:${pos[1]}%;--compact-x:${compact[0]}%;--compact-y:${compact[1]}%" data-player-id="${p.id}"><div class="seat-cards" style="${cardStyle}">${cards}</div>${roleFrame}${worship}<div class="badge ${active} ${roleFrame?"has-role":""}" style="border-color:${color}99;--timer-color:${color};--timer-deg:360deg">${playerNameTag(p,you,color)}<div class="pchips">${p.chips}</div><div class="pstatus">${status}<br><span class="rebuy-count">Buy-in: ${p.effectiveRebuyUnits??p.rebuyUnits??1}</span>${p.squids?`<br><span class="squid-line">Squid: ${p.squids}</span>`:""}${botActions}</div>${peek}${burst}</div>${boardChoice}${bet}</div>`}).join("");positionSeats();updateBadgeTimers();if((s.winners||[]).length&&winnerKey!==lastWinnerKey){lastWinnerKey=winnerKey;playSound("win");animateWinnerChips((s.winners||[]).filter(w=>Number(w.amount)||0))}else if(!(s.winners||[]).length){lastWinnerKey=""}els.seats.querySelectorAll("[data-board-choice]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();send("choose_boards",{count:Number(btn.dataset.boardChoice||1)})});els.seats.querySelectorAll("[data-peek]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();send("peek_hand",{targetId:btn.dataset.peek})});els.seats.querySelectorAll("[data-refill-bot]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();const raw=prompt("Refill how many buy-in units? Use negative to return chips.");if(raw!==null){const units=Number(raw);if(Number.isFinite(units))send("refill_bot",{targetId:btn.dataset.refillBot,units:Math.trunc(units)})}});els.seats.querySelectorAll("[data-worship]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();const amount=Number(prompt("Worship how many chips?")||0);if(Number.isFinite(amount)&&amount>0)send("worship",{targetId:btn.dataset.worship,amount:Math.floor(amount)})});const canAct=!!you.canAct,canStraddle=!!you.canStraddle,canShowdown=!!you.canShowdownAct,canOptionalShow=!!you.canOptionalShow,callNeed=Math.max(0,s.currentBet-(you.currentBet||0));els.prefold.disabled=!(you.canPrefold||you.prefold);els.prefold.innerHTML=you.prefold?"Cancel<br>Check/Fold":"Check /<br>Fold";els.prefold.classList.toggle("prefold-on",!!you.prefold);els.fold.disabled=!canAct;els.check.disabled=!canAct||callNeed>0;els.call.disabled=!canAct||callNeed<=0;els.allIn.disabled=!canAct;els.raise.disabled=!canAct;els.raiseAmount.disabled=!canAct;document.querySelectorAll(".quick-bet").forEach(btn=>btn.disabled=!canAct||((you.currentBet||0)+(you.chips||0)<=Math.max((s.currentBet||0)+(s.minRaise||s.bigBlind),s.bigBlind)));els.noStraddle.disabled=!(canStraddle||canShowdown||canOptionalShow);els.straddle.disabled=!(canStraddle||canShowdown||canOptionalShow);const noStraddleLabel=(canShowdown||canOptionalShow)?(canOptionalShow?"Don't<br>Show":"Muck"):"No<br>Straddle";els.noStraddle.innerHTML=noStraddleLabel;els.noStraddle.classList.toggle("action-wrap",noStraddleLabel.includes("<br>"));const canClaimSquidNow=!!(you.canOptionalShow&&s.players.find(p=>p.id===you.id&&p.canClaimSquid));const straddleLabel=(canShowdown||canOptionalShow)?(canOptionalShow?(canClaimSquidNow?(s.squid?.claimSize===2?"Show +<br>2 Squids":"Show +<br>Squid"):"Show"):"Show"):(s.straddleAmount?`Straddle ${s.straddleAmount}`:"Straddle");els.straddle.innerHTML=straddleLabel;els.straddle.classList.toggle("action-wrap",straddleLabel.includes("<br>"));els.call.textContent=callNeed?`Call ${callNeed}`:"Call";const minRaiseTo=Math.max((s.currentBet||0)+(s.minRaise||s.bigBlind),s.bigBlind);els.raise.textContent="Raise";els.raiseAmount.min=minRaiseTo;els.raiseAmount.placeholder="Enter for raise";if(canChooseBoards){els.prefold.disabled=true;els.fold.disabled=true;els.check.disabled=true;els.call.disabled=true;els.allIn.disabled=true;els.noStraddle.disabled=true;els.straddle.disabled=true;els.raise.disabled=true;els.raiseAmount.disabled=true;document.querySelectorAll(".quick-bet").forEach(btn=>btn.disabled=true);els.boardChoiceHint.innerHTML=(els.boardChoiceHint.innerHTML?els.boardChoiceHint.innerHTML+"<br>":"")+`Choose boards beside your name tag.<br>Lowest player choice decides.<br>Max ${you.boardChoiceMax||s.boardChoice?.max||1}.`;els.boardChoiceHint.classList.remove("hidden");}}
+let previousSeatMarkup = "";
+function render(payload){
+  const previous = latest;
+  latest = payload;
+  if (!previous || previous.state.bettingRound !== payload.state.bettingRound) {
+    els.raiseAmount.value = "";
+  }
+  if (!previous || previous.state.handId !== payload.state.handId ||
+      previous.state.stage !== payload.state.stage ||
+      previous.state.currentPlayerId !== payload.state.currentPlayerId ||
+      previous.you.readyNextHand !== payload.you.readyNextHand) {
+    els.notice.textContent = "";
+  }const s=payload.state;updateTomatoSummary(s.tomatoSummary, s.players);const you=payload.you,seatedRaw=s.players.filter(p=>!p.isSpectator).slice(0,s.maxSeats||10),youSeat=seatedRaw.findIndex(p=>p.id===you.id),seated=youSeat>=0?[...seatedRaw.slice(youSeat),...seatedRaw.slice(0,youSeat)]:seatedRaw;const roomLabel=s.roomName||s.roomCode;els.topbar.textContent=roomCode?`Connected to ${roomLabel}${you.isSpectator?" as spectator":""}`:"";els.meta.textContent=`Room ${roomLabel} | ${s.stage.toUpperCase()} | Blinds ${s.smallBlind}/${s.bigBlind} | Clock ${s.actionTimeout}s | Seats ${seated.length}/${s.maxSeats}`;els.potLabel.textContent=`Total Pot: ${s.pot}`;els.pokerGodChips.textContent=s.pokerGodChips||0;clockDeadline=s.actionDeadline?Math.round(s.actionDeadline*1000):0;updateClock();els.boardChoiceHint.textContent="";els.boardChoiceHint.classList.add("hidden");const messageParts=splitSquidText(s.message||(you.isSpectator?"Spectating.":""));const playerColorByName=Object.fromEntries((s.players||[]).map(p=>[p.name,playerColors[(p.colorIndex||0)%playerColors.length]]));const boardChoiceActive=!!(s.boardChoice&&s.boardChoice.active);els.tableNotice.innerHTML=boardChoiceActive?"":colorNotice(messageParts.main,playerColorByName);if(!boardChoiceActive&&!s.canStartHand&&s.startBlockedReason&&["lobby","showdown"].includes(s.stage)){els.tableNotice.innerHTML+=(els.tableNotice.innerHTML?"<br>":"")+colorNotice(s.startBlockedReason,playerColorByName)}if(boardChoiceActive&&messageParts.main){els.boardChoiceHint.innerHTML=colorNotice(messageParts.main,playerColorByName);els.boardChoiceHint.classList.remove("hidden");}$("tomatoBalance").textContent=you.tomatoes??"—";const history=s.handHistory||[];if(history.length<lastSoundCount)lastSoundCount=0;if(lastSoundCount&&history.length>lastSoundCount){history.slice(lastSoundCount).forEach(h=>{const action=String(h.action||"").toLowerCase();if(action==="check")playSound("check");else if(action==="fold"||action==="timeout fold"||action==="prefold")playSound("fold");else if(action==="buy time")playSound("buyTime");else if(/^(small blind|big blind|call|raise|all-in|call all-in|straddle)$/.test(action))playSound("bet")})}lastSoundCount=history.length;els.historyList.innerHTML=history.length?history.slice().reverse().map(h=>{if(h.stage==="result"&&h.stacks)return `<div class="history-row">${handResultMarkup(h,h.time)}</div>`;const color=playerColorByName[h.player]||"#ffe28a",stack=h.stackBefore!==null&&h.stackBefore!==undefined?` <span class="history-stack">(${h.stackBefore} -> ${h.stackAfter})</span>`:"";return `<div class="history-row" style="border-left:4px solid ${color}"><div class="history-main"><b style="color:${color}">${esc(h.player)}</b> ${esc(h.action)}${h.amount?` ${h.amount}`:""}${stack}</div><div class="history-sub">${String(h.stage).toUpperCase()} | ${h.thinkingTime}s | ${h.time}</div></div>`}).join(""):`<div class="history-empty">No betting yet.</div>`;const peek=s.peekSummary||{},peekRows=peek.actions||[];els.peekSummary.innerHTML=peekRows.length?`<div class="peek-row"><b>Total</b> ${peek.count||0} peek(s), ${peek.total||0} chips to Poker God</div>`+peekRows.slice().reverse().map(p=>`<div class="peek-row"><b>${esc(p.player)}</b> paid ${p.amount}<br>${esc(p.note)}</div>`).join(""):`<div class="history-empty">No peeks yet.</div>`;const worship=s.worshipSummary||{},worshipRows=worship.actions||[];els.worshipSummary.innerHTML=worshipRows.length?`<div class="peek-row"><b>Total</b> ${worship.count||0} worship(s), ${worship.total||0} chips moved</div>`+worshipRows.slice().reverse().map(w=>{const giverColor=playerColorByName[w.player]||"#f7fbff",targetColor=playerColorByName[w.target]||"#f7fbff",stack=w.stackBefore!==null&&w.stackBefore!==undefined?`<br>${w.stackBefore} -> ${w.stackAfter}`:"";return `<div class="peek-row"><b style="color:${giverColor}">${esc(w.player)}</b> -> <b style="color:${targetColor}">${esc(w.target)}</b> ${w.amount}${stack}</div>`}).join(""):`<div class="history-empty">No worship yet.</div>`;renderScoreboard(s,you,playerColorByName);const chats=s.chatMessages||[];els.chatMessages.innerHTML=chats.length?chats.map(m=>{const chatColor=playerColorByName[m.player]||"#f7fbff";return `<div class="chat-row"><b style="color:${chatColor}">${esc(m.player)}</b> ${esc(m.text)}</div>`}).join(""):`<div class="chat-row">No messages yet.</div>`;els.chatMessages.scrollTop=els.chatMessages.scrollHeight;const prev=s.previousHands||[];els.previousHands.innerHTML=prev.slice().reverse().map(h=>`<div class="previous-hand">${handResultMarkup(h,h.endedAt)}<br>${h.path||""}</div>`).join("");if(s.bankrollAudit){els.meta.textContent+=` | Bankroll ${s.bankrollAudit.live}/${s.bankrollAudit.effectiveBuyIns}`;}if(s.squid&&s.squid.active){els.meta.textContent+=` | Squids ${s.squid.claimed}/${s.squid.total} @ ${s.squid.price}`;}const squidActive=!!(s.squid&&s.squid.active),squidBlocks=[];if(squidActive){const holdersRaw=(s.squid.holders||[]).map(h=>`${h.name}: ${h.squids}`).join(" | ")||"None yet",holders=colorNotice(holdersRaw,playerColorByName),pending=s.squid.pendingPlayer?`<br>First claim reserved for: ${colorNotice(s.squid.pendingPlayer,playerColorByName)}`:"";squidBlocks.push(`<b>Squid Status</b><br>Claimed: ${s.squid.claimed} | Unclaimed: ${s.squid.remaining} | Price: ${s.squid.price}${s.squid.foldSquid?" | Fold Squid":""}${pending}<br>Holders: ${holders}`);}if(messageParts.squid){squidBlocks.push(colorNotice(messageParts.squid,playerColorByName));}els.squidStatus.classList.toggle("hidden",!squidBlocks.length);els.squidStatus.innerHTML=squidBlocks.join("<hr>");const hostSettings=!!you.isHost,canConfigureSquid=hostSettings&&!!(s.squid&&s.squid.canConfigure);els.squidTotal.disabled=!canConfigureSquid;els.squidPrice.disabled=!canConfigureSquid;els.foldSquid.disabled=!canConfigureSquid;els.squidTotal.min=s.squid&&s.squid.minimum?s.squid.minimum:0;els.peekToggle.textContent=`Peek: ${s.peekEnabled?"On":"Off"}`;els.peekToggle.disabled=!hostSettings;els.worshipToggle.textContent=`Worship: ${s.worshipEnabled?"On":"Off"}`;els.worshipToggle.disabled=!hostSettings;if(!squidSettingsDirty){els.squidTotal.value=s.squid?s.squid.total:0;els.squidPrice.value=s.squid?s.squid.price:0;els.foldSquid.checked=!!s.squid?.foldSquid;appliedSquidKey=squidKey();}updateSquidButton(canConfigureSquid,hostSettings&&!!(s.squid&&s.squid.canRestart));if(!settingsDirty){els.smallBlind.value=s.smallBlind;els.bigBlind.value=s.bigBlind;els.actionTimeout.value=s.actionTimeout;els.buyTimeSeconds.value=s.buyTimeSeconds||30;els.chipsPerBuyIn.value=s.chipsPerBuyIn||0;els.peekPriceMin.value=s.peekPriceMin||0;els.peekPriceMax.value=s.peekPriceMax||0;appliedSettingsKey=`${s.smallBlind}|${s.bigBlind}|${s.chipsPerBuyIn||1000}|${s.actionTimeout}|${s.buyTimeSeconds||30}|${s.peekPriceMin||0}|${s.peekPriceMax||0}`;}els.bigBlind.min=els.smallBlind.value;els.startHand.disabled=!s.canStartHand;els.shuffleSeats.disabled=!you.canShuffleSeats;els.addBot.disabled=!(hostSettings&&(s.stage==="lobby"||s.stage==="showdown")&&seated.length<(s.maxSeats||10));els.joinSeat.disabled=!you.canRequestSeat;els.joinSeat.textContent=you.wantsSeat?"Seat Requested":"Join Game Next Hand";els.join.disabled=false;const settingsUnlocked=hostSettings&&(s.stage==="lobby"||s.stage==="showdown");updateSettingsButton(settingsUnlocked);els.smallBlind.disabled=!settingsUnlocked;els.bigBlind.disabled=!settingsUnlocked;els.chipsPerBuyIn.disabled=false;els.chipsPerBuyIn.readOnly=false;els.actionTimeout.disabled=!settingsUnlocked;els.buyTimeSeconds.disabled=!settingsUnlocked;els.peekPriceMin.disabled=!settingsUnlocked;els.peekPriceMax.disabled=!settingsUnlocked;els.rebuyPanel.classList.toggle("hidden",!!you.isSpectator);const showCenterReady=!you.isSpectator&&(s.stage==="lobby"||s.stage==="showdown");const readyTurnsToStart=you.readyNextHand&&s.canStartHand;els.readyNext.textContent=readyTurnsToStart?"Start Next Hand":you.readyNextHand?"Ready ✓":"Ready";els.readyNext.classList.toggle("start-mode",!!readyTurnsToStart);els.readyNext.disabled=!you.canReady||(you.readyNextHand&&!s.canStartHand);els.readyNext.title=you.readyNextHand&&!s.canStartHand?s.startBlockedReason||"":"";els.startHand.disabled=!you.canReady||!s.canStartHand;els.startHand.title=s.startBlockedReason||"";els.centerReadyHost.classList.toggle("hidden",!showCenterReady);const chipsPerBuyIn=s.chipsPerBuyIn||1000;const refillHint="1 buy-in = "+chipsPerBuyIn.toLocaleString("en-US")+" chips";if(els.refillBuyInHint.textContent!==refillHint)els.refillBuyInHint.textContent=refillHint;const minReturn=Math.max(-Math.floor((you.chips||0)/chipsPerBuyIn),-(you.rebuyUnits||0));els.rebuyUnits.min=minReturn;els.rebuyUnits.placeholder=`Min ${minReturn}`;if(you.refillSubmitted)els.rebuyUnits.value=you.pendingRebuyUnits||0;els.rebuyUnits.disabled=!!you.refillSubmitted;if(Number(els.rebuyUnits.value)<minReturn)els.rebuyUnits.value=minReturn;els.rebuy.textContent=you.refillSubmitted?"Submitted":"Apply Refill";els.rebuy.disabled=!!you.refillSubmitted||!!you.isSpectator;const canChooseBoards=!!you.canChooseBoards,boards=s.communityBoards||[],boardCards=s.communityCards||s.community||[],maxWin=Math.max(0,...(s.winners||[]).map(w=>Number(w.amount)||0)),winnerIds=new Set((s.winners||[]).filter(w=>maxWin>0&&(Number(w.amount)||0)===maxWin).map(w=>w.id)),winnerKey=`${s.handId||""}|${(s.winners||[]).map(w=>`${w.id}:${w.amount}`).join(",")}`;els.board.classList.toggle("multi",boards.length>1);els.board.innerHTML=boards.length>1?boards.map((b,i)=>`<div class="board-row"><span class="board-tag">Board ${i+1}</span>${b.map(c=>cardEl(c)).join("")}</div>`).join(""):(boardCards.length?boardCards:[null,null,null,null,null]).map(c=>cardEl(c)).join("");els.buyTime.classList.toggle("hidden",!you.canAct);els.buyTime.disabled=!you.canBuyTime;els.buyTime.textContent=`Buy Time (${s.buyTimePrice||0})`;els.showEndedHand.classList.toggle("hidden",!you.canShowEndedHand);els.showEndedHand.disabled=!you.canShowEndedHand;els.hand.classList.toggle("folded",!!you.folded);els.hand.innerHTML=((you.cards&&you.cards.length)?you.cards:[null,null]).map(c=>cardEl(c)).join("");const seatMarkup=seated.map((p,i)=>{const pos=seatPositions[i]||[50,50],compact=compactSeatPositions[i]||pos,leftSide=pos[0]<35,rightSide=pos[0]>65,topSide=pos[1]<30,active=p.id===s.currentPlayerId?"active":"",self=p.id===you.id?"self":"",cards=(p.cards||[null,null]).map(c=>cardEl(c,true)).join(""),status=`${p.isBot?"Bot":(p.role||"Online")}${p.folded?" Folded":""}${p.allIn?" All-in":""}${p.connected?"":" Away"}`.trim()||"Online",cardStyle=topSide?"--item-x:34px;--item-y:-44px":leftSide?"--item-x:-56px;--item-y:24px":rightSide?"--item-x:128px;--item-y:24px":"--item-x:34px;--item-y:78px",betSide=pos[1]<15?"toward-bottom":rightSide?"toward-left":"toward-right",color=playerColors[(p.colorIndex||0)%playerColors.length],bet=p.currentBet>0?`<div class="seat-bet ${betSide}"><span class="bet-label"><span class="chip red"></span>${p.currentBet}</span></div>`:(p.checked?`<div class="seat-bet ${betSide}"><span class="check-label"><span class="chip white"></span>Check</span></div>`:"");const canOfferPeek=!!(p.canPeek||(s.peekEnabled&&you.folded&&!you.isSpectator&&p.id!==you.id&&p.cardCount>0&&!p.privatePeek&&["straddle","preflop","flop","turn","river","board_choice","reveal","optional_show"].includes(s.stage))),peek=canOfferPeek?`<button class="peek-btn" data-peek="${p.id}">Peek</button>`:"",botActions=hostSettings&&p.isBot?`<div class="bot-tag-actions">${p.refillSubmitted?`<button class="bot-tag-btn bot-refill-btn" type="button" disabled>Refill set</button>`:`<button class="bot-tag-btn bot-refill-btn" data-refill-bot="${p.id}" type="button">Refill</button>`}${["lobby","showdown"].includes(s.stage)?`<button class="bot-tag-btn bot-remove-btn" data-remove-bot="${p.id}" type="button">Remove</button>`:""}</div>`:"",worship=(s.worshipEnabled&&!you.isSpectator&&p.id!==you.id&&!p.isSpectator)?`<button class="worship-btn" data-worship="${p.id}" title="Worship chips">W</button>`:"",burst=winnerIds.has(p.id)?`<div class="winner-burst"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>`:"",boardChoice=p.id===you.id&&canChooseBoards?`<div class="board-choice-pop">${[1,2,3,4].map(n=>`<button data-board-choice="${n}" ${n>(you.boardChoiceMax||s.boardChoice?.max||1)?"disabled":""}>${n}</button>`).join("")}</div>`:"";const roleFrame=seatRoleFrame(p.id,s.seatTokens);return `<div class="seat ${self} ${p.folded?"folded":""}" style="--seat-x:${pos[0]}%;--seat-y:${pos[1]}%;--compact-x:${compact[0]}%;--compact-y:${compact[1]}%" data-player-id="${p.id}"><div class="seat-cards" style="${cardStyle}">${cards}</div>${roleFrame}${worship}<div class="badge ${active} ${roleFrame?"has-role":""}" style="border-color:${color}99;--timer-color:${color};--timer-deg:360deg">${playerNameTag(p,you,color)}<div class="pchips">${p.chips}</div><div class="pstatus">${status}<br><span class="rebuy-count">Buy-in: ${p.effectiveRebuyUnits??p.rebuyUnits??1}</span>${p.squids?`<br><span class="squid-line">Squid: ${p.squids}</span>`:""}${botActions}</div>${peek}${burst}</div>${boardChoice}${bet}</div>`}).join("");
+const seatsChanged = seatMarkup !== previousSeatMarkup;
+if (seatsChanged) {
+  els.seats.innerHTML = seatMarkup;
+  previousSeatMarkup = seatMarkup;
+  positionSeats();
+}
+updateBadgeTimers();if((s.winners||[]).length&&winnerKey!==lastWinnerKey){lastWinnerKey=winnerKey;playSound("win");animateWinnerChips((s.winners||[]).filter(w=>Number(w.amount)||0))}else if(!(s.winners||[]).length){lastWinnerKey=""}els.seats.querySelectorAll("[data-board-choice]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();send("choose_boards",{count:Number(btn.dataset.boardChoice||1)})});els.seats.querySelectorAll("[data-peek]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();send("peek_hand",{targetId:btn.dataset.peek})});els.seats.querySelectorAll("[data-refill-bot]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();const raw=prompt("Refill how many buy-in units? Use negative to return chips.");if(raw!==null){const units=Number(raw);if(Number.isFinite(units))send("refill_bot",{targetId:btn.dataset.refillBot,units:Math.trunc(units)})}});els.seats.querySelectorAll("[data-worship]").forEach(btn=>btn.onclick=e=>{e.stopPropagation();const amount=Number(prompt("Worship how many chips?")||0);if(Number.isFinite(amount)&&amount>0)send("worship",{targetId:btn.dataset.worship,amount:Math.floor(amount)})});const canAct=!!you.canAct,canStraddle=!!you.canStraddle,canShowdown=!!you.canShowdownAct,canOptionalShow=!!you.canOptionalShow,callNeed=Math.max(0,s.currentBet-(you.currentBet||0));els.prefold.disabled=!(you.canPrefold||you.prefold);els.prefold.innerHTML=you.prefold?"Cancel<br>Check/Fold":"Check /<br>Fold";els.prefold.classList.toggle("prefold-on",!!you.prefold);els.fold.disabled=!canAct;els.check.disabled=!canAct||callNeed>0;els.call.disabled=!canAct||callNeed<=0;els.allIn.disabled=!canAct;const maxRaiseTo=(you.currentBet||0)+(you.chips||0),minRaiseTo=(s.currentBet||0)+(s.minRaise||s.bigBlind),canRaise=canAct&&maxRaiseTo>=minRaiseTo;els.raise.disabled=!canRaise;els.raiseAmount.disabled=!canRaise;document.querySelectorAll(".quick-bet").forEach(btn=>btn.disabled=!canRaise);els.noStraddle.disabled=!(canStraddle||canShowdown||canOptionalShow);els.straddle.disabled=!(canStraddle||canShowdown||canOptionalShow);const noStraddleLabel=(canShowdown||canOptionalShow)?(canOptionalShow?"Don't<br>Show":"Muck"):"No<br>Straddle";els.noStraddle.innerHTML=noStraddleLabel;els.noStraddle.classList.toggle("action-wrap",noStraddleLabel.includes("<br>"));const canClaimSquidNow=!!(you.canOptionalShow&&s.players.find(p=>p.id===you.id&&p.canClaimSquid));const straddleLabel=(canShowdown||canOptionalShow)?(canOptionalShow?(canClaimSquidNow?(s.squid?.claimSize===2?"Show +<br>2 Squids":"Show +<br>Squid"):"Show"):"Show"):(s.straddleAmount?`Straddle ${s.straddleAmount}`:"Straddle");els.straddle.innerHTML=straddleLabel;els.straddle.classList.toggle("action-wrap",straddleLabel.includes("<br>"));els.call.textContent=callNeed?`Call ${callNeed}`:"Call";els.raiseAmount.min=minRaiseTo;els.raiseAmount.max=maxRaiseTo;els.raiseAmount.placeholder="Min "+minRaiseTo;if(!canAct)els.raiseAmount.value="";if(canChooseBoards){els.prefold.disabled=true;els.fold.disabled=true;els.check.disabled=true;els.call.disabled=true;els.allIn.disabled=true;els.noStraddle.disabled=true;els.straddle.disabled=true;els.raise.disabled=true;els.raiseAmount.disabled=true;document.querySelectorAll(".quick-bet").forEach(btn=>btn.disabled=true);els.boardChoiceHint.innerHTML=(els.boardChoiceHint.innerHTML?els.boardChoiceHint.innerHTML+"<br>":"")+`Choose boards beside your name tag.<br>Lowest player choice decides.<br>Max ${you.boardChoiceMax||s.boardChoice?.max||1}.`;els.boardChoiceHint.classList.remove("hidden");}}
 async function createRoom(){if(creatingRoom)return;creatingRoom=true;try{els.meta.textContent="Creating room...";els.create.disabled=true;const res=await fetch("/rooms",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:els.name.value||"Player",password:els.roomPassword.value||"",playerPassword:els.playerPassword.value||""})}),data=await res.json();if(!res.ok||!data.roomCode||!data.playerId){throw new Error(data.error||data.detail||"Could not create room")}roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.roomCode.value=roomCode;els.meta.textContent=`Created room ${roomCode}.`;connect()}catch(err){els.notice.textContent=err.message||"Could not create room";els.meta.textContent=`Create failed: ${err.message||"Could not create room"}`;}finally{creatingRoom=false;els.create.disabled=false}}
 function normalizeRoomCode(value){const raw=(value||"").trim().toUpperCase();const match=raw.match(/[A-Z0-9]{5}/);return match?match[0]:raw}
 async function joinRoom(){if(joiningRoom)return;joiningRoom=true;try{const code=normalizeRoomCode(els.roomCode.value);els.roomCode.value=code;if(!code){els.notice.textContent="Enter a room code.";els.meta.textContent="Enter a room code.";return}const idForJoin=code===roomCode?(playerId||""):"";const res=await fetch(`/rooms/${code}/join`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:els.name.value||"Player",playerId:idForJoin,password:els.roomPassword.value||"",playerPassword:els.playerPassword.value||""})}),data=await res.json();if(!res.ok){const msg=data.error||data.detail||"Could not join room";els.notice.textContent=msg;els.meta.textContent=`Join failed: ${msg}`;return}roomCode=data.roomCode;playerId=data.playerId;localStorage.setItem("roomCode",roomCode);localStorage.setItem("playerId",playerId);sessionStorage.setItem("playerId",playerId);els.meta.textContent=`Joined room ${roomCode}.`;connect()}catch(err){els.notice.textContent=err.message||"Could not join room";els.meta.textContent=`Join failed: ${err.message||"Could not join room"}`;}finally{joiningRoom=false}}
@@ -3667,13 +3740,26 @@ let tomatoPairs = {};
 let tomatoTotal = 0;
 let tomatoSnapshotTotal = -1;
 
-function showdownHistoryMarkup(showdown) {
-  if (!showdown) return "";
-  const participants = showdown.participants.map(name => "<b>" + esc(name) + "</b>").join(", ");
-  const winners = showdown.winners.map(winner =>
-    '<div>' + esc(winner.name) + ' ' + winner.before + ' → ' + winner.after + '</div>'
-  ).join("");
-  return '<div>Showdown · River: ' + participants + '</div><div class="history-winners">' + winners + '</div>';
+function handResultMarkup(hand, timestamp) {
+  const participants = hand.showdown?.participants || [];
+  const winners = hand.winners || [];
+  const stacks = hand.stacks || [];
+  const pot = winners.map(winner => esc(winner.name) + " +" + winner.amount).join(", ");
+  const byId = new Map(stacks.map(player => [player.playerId, player]));
+  const winnerIds = new Set(winners.map(winner => winner.id));
+  const ordered = winners.map(winner => byId.get(winner.id)).filter(Boolean)
+    .concat(stacks.filter(player => !winnerIds.has(player.playerId)));
+  const changes = ordered.map(player => {
+    const change = player.after - player.before;
+    const style = change > 0 ? 'history-stack-gain' : change < 0 ? 'history-stack-loss' : '';
+    return '<span class="' + style + '">' + esc(player.name) + ' ' + (change >= 0 ? '+' : '') + change + '</span>';
+  });
+  const detail = stacks.map(player => esc(player.name) + " " + player.before + " -> " + player.after).join(" | ");
+  return '<div class="hand-result"><div>' + esc(timestamp) + '</div>' +
+    (participants.length ? '<div>Showdown · River: <b>' + participants.map(esc).join(", ") + '</b></div>' : '') +
+    '<div><b>POT:</b> <span class="history-pot">' + (pot || "No winner") + '</span></div>' +
+    (stacks.length ? '<div><b>STACK:</b> ' + changes.join(", ") + '</div><div>' + detail + '</div>' : '') +
+    '</div>';
 }
 
 function renderTomatoPanel() {
@@ -3682,11 +3768,11 @@ function renderTomatoPanel() {
     b.count - a.count || a.fromName.localeCompare(b.fromName) || a.targetName.localeCompare(b.targetName));
   const totals = new Map();
   function playerTotal(id, name) {
-    if (!totals.has(id)) totals.set(id, {name, thrown: 0, received: 0});
+    if (!totals.has(id)) totals.set(id, {name, thrown: 0, received: 0, owned: tomatoPlayers.get(id)?.tomatoes});
     return totals.get(id);
   }
 
-  for (const [id, name] of tomatoPlayers) playerTotal(id, name);
+  for (const [id, player] of tomatoPlayers) playerTotal(id, player.name);
   for (const pair of rows) {
     playerTotal(pair.fromId, pair.fromName).thrown += pair.count;
     playerTotal(pair.targetId, pair.targetName).received += pair.count;
@@ -3694,8 +3780,8 @@ function renderTomatoPanel() {
   const players = Array.from(totals.values()).sort((a, b) => a.name.localeCompare(b.name));
   $("tomatoPlayerRows").innerHTML = players.length
     ? players.map(player => '<tr><th scope="row">' + esc(player.name) + '</th><td>' +
-        player.thrown + '</td><td>' + player.received + '</td></tr>').join("")
-    : '<tr><td colspan="3">No players yet.</td></tr>';
+        player.thrown + '</td><td>' + player.received + '</td><td>' + (player.owned ?? '—') + '</td></tr>').join("")
+    : '<tr><td colspan="4">No players yet.</td></tr>';
 
   $("tomatoPairs").innerHTML = rows.length
     ? rows.map(pair => '<div class="peek-row tomato-pair"><span>' + esc(pair.fromName) + ' → ' +
@@ -3712,9 +3798,10 @@ function resetTomatoSummary() {
 }
 
 function updateTomatoSummary(summary, players) {
-  const roster = new Map(players.filter(player => !player.isSpectator).map(player => [player.id, player.name]));
+  const roster = new Map(players.filter(player => !player.isSpectator).map(player => [player.id, player]));
   const rosterChanged = roster.size !== tomatoPlayers.size ||
-    Array.from(roster).some(([id, name]) => tomatoPlayers.get(id) !== name);
+    Array.from(roster).some(([id, player]) =>
+      tomatoPlayers.get(id)?.name !== player.name || tomatoPlayers.get(id)?.tomatoes !== player.tomatoes);
   tomatoPlayers = roster;
 
   if (!summary || summary.total <= tomatoSnapshotTotal) {
@@ -4036,6 +4123,6 @@ const tableResize = new ResizeObserver(() => {
 tableResize.observe(els.tableShell);
 tableResize.observe(tableStage);
 updateDrawers();
-els.loginBtn.onclick=async()=>{const name=(els.loginName.value||"").trim(),password=els.loginPassword.value||"",inviteCode=els.inviteCode.value||"";try{els.loginNotice.textContent="Logging in...";const res=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:name,password,inviteCode})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not log in");localStorage.setItem("authName",data.username||name);localStorage.setItem("authPassword",password);els.loginNotice.textContent="";showLobby()}catch(err){els.loginNotice.textContent=err.message||"Could not log in"}};els.logoutBtn.onclick=()=>{localStorage.removeItem("authName");localStorage.removeItem("authPassword");showLogin()};els.backLobby.onclick=()=>{if(ws)ws.close();roomCode="";playerId="";localStorage.removeItem("roomCode");localStorage.removeItem("playerId");sessionStorage.removeItem("playerId");showLobby();setTimeout(loadRooms,300)};window.onpopstate=()=>{const pathRoom=roomCodeFromPath();if(pathRoom&&authName()){roomCode=pathRoom;els.roomCode.value=roomCode;showGame();connect()}else if(authName()){showLobby()}else{showLogin()}};els.cancelJoinPrompt.onclick=closeJoinPrompt;els.confirmJoinPrompt.onclick=()=>joinLobbyRoom(pendingJoinRoomCode,els.joinPromptPassword.value||"");els.joinPromptPassword.onkeydown=e=>{if(e.key==="Enter")joinLobbyRoom(pendingJoinRoomCode,els.joinPromptPassword.value||"")};els.refreshRooms.onclick=loadRooms;els.createLobbyRoom.onclick=createLobbyRoom;els.create.onclick=createRoom;els.join.onclick=joinRoom;els.startHand.onclick=()=>send("start_hand");els.shuffleSeats.onclick=()=>send("shuffle_seats");els.addBot.onclick=()=>send("add_bot");els.joinSeat.onclick=()=>send("request_seat");function markSettingsDirty(){settingsDirty=settingsKey()!==appliedSettingsKey;updateSettingsButton(latest?latest.state.stage==="lobby"||latest.state.stage==="showdown":true)}els.smallBlind.oninput=()=>{els.bigBlind.min=els.smallBlind.value;if(Number(els.bigBlind.value)<Number(els.smallBlind.value))els.bigBlind.value=els.smallBlind.value;markSettingsDirty()};els.bigBlind.oninput=markSettingsDirty;els.chipsPerBuyIn.oninput=markSettingsDirty;els.actionTimeout.oninput=markSettingsDirty;els.buyTimeSeconds.oninput=markSettingsDirty;els.peekPriceMin.oninput=()=>{if(Number(els.peekPriceMax.value)<Number(els.peekPriceMin.value))els.peekPriceMax.value=els.peekPriceMin.value;markSettingsDirty()};els.peekPriceMax.oninput=markSettingsDirty;els.setBlinds.onclick=()=>{settingsDirty=false;appliedSettingsKey=settingsKey();updateSettingsButton(latest?latest.state.stage==="lobby"||latest.state.stage==="showdown":true);send("set_blinds",{smallBlind:Number(els.smallBlind.value),bigBlind:Number(els.bigBlind.value),chipsPerBuyIn:Number(els.chipsPerBuyIn.value),actionTimeout:Number(els.actionTimeout.value),buyTimeSeconds:Number(els.buyTimeSeconds.value),peekPriceMin:Number(els.peekPriceMin.value),peekPriceMax:Number(els.peekPriceMax.value)})};function markSquidDirty(){squidSettingsDirty=squidKey()!==appliedSquidKey;updateSquidButton(latest&&latest.state&&latest.state.squid?latest.state.squid.canConfigure:true,!!(latest&&latest.state&&latest.state.squid&&latest.state.squid.canRestart))}els.squidTotal.oninput=markSquidDirty;els.squidPrice.oninput=markSquidDirty;els.foldSquid.onchange=markSquidDirty;els.setSquid.onclick=()=>{squidSettingsDirty=false;appliedSquidKey=squidKey();updateSquidButton(latest&&latest.state&&latest.state.squid?latest.state.squid.canConfigure:true,!!(latest&&latest.state&&latest.state.squid&&latest.state.squid.canRestart));send("set_squid",{total:Number(els.squidTotal.value),price:Number(els.squidPrice.value),foldSquid:els.foldSquid.checked})};els.peekToggle.onclick=()=>send("set_peek_enabled",{enabled:!(latest&&latest.state&&latest.state.peekEnabled)});els.worshipToggle.onclick=()=>send("set_worship_enabled",{enabled:!(latest&&latest.state&&latest.state.worshipEnabled)});els.prefold.onclick=()=>send("prefold",{bettingRound:latest?.state.bettingRound});els.fold.onclick=()=>send("fold");els.check.onclick=()=>send("check");els.call.onclick=()=>send("call");function closeAllInConfirm(){els.allInConfirm.classList.add("hidden")}els.allIn.onclick=()=>{if(!els.allIn.disabled)els.allInConfirm.classList.remove("hidden")};els.allInCancel.onclick=closeAllInConfirm;els.allInConfirmBtn.onclick=()=>{closeAllInConfirm();send("all_in")};els.allInConfirm.onclick=e=>{if(e.target===els.allInConfirm)closeAllInConfirm()};els.buyTime.onclick=()=>send("buy_time");els.showEndedHand.onclick=()=>send("show_ended_hand");els.noStraddle.onclick=()=>send(latest&&latest.you&&(latest.you.canShowdownAct||latest.you.canOptionalShow)?"muck_hand":"no_straddle");els.straddle.onclick=()=>send(latest&&latest.you&&(latest.you.canShowdownAct||latest.you.canOptionalShow)?"show_hand":"straddle");document.querySelectorAll(".quick-bet").forEach(btn=>btn.onclick=()=>quickBetTo(Number(btn.dataset.potPercent||0)));els.raise.onclick=()=>send("raise",{amount:Number(els.raiseAmount.value||0)});els.readyNext.onclick=()=>{if(latest&&latest.you&&latest.you.readyNextHand)send("start_hand");else send("ready_next_hand")};els.rebuy.onclick=()=>send("rebuy",{units:Number(els.rebuyUnits.value||0)});function sendChat(){const text=(els.chatInput.value||"").trim();if(!text)return;els.chatInput.value="";send("chat",{text})}els.chatSend.onclick=sendChat;els.chatInput.onkeydown=e=>{if(e.key==="Enter")sendChat()};setInterval(updateClock,1000);if(authName()){const pathRoom=roomCodeFromPath();if(pathRoom){roomCode=pathRoom;els.roomCode.value=roomCode;showGame();connect()}else{showLobby()}}else{showLogin()}
+els.loginBtn.onclick=async()=>{const name=(els.loginName.value||"").trim(),password=els.loginPassword.value||"",inviteCode=els.inviteCode.value||"";try{els.loginNotice.textContent="Logging in...";const res=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:name,password,inviteCode})}),data=await res.json();if(!res.ok)throw new Error(data.error||"Could not log in");localStorage.setItem("authName",data.username||name);localStorage.setItem("authPassword",password);els.loginNotice.textContent="";showLobby()}catch(err){els.loginNotice.textContent=err.message||"Could not log in"}};els.logoutBtn.onclick=()=>{localStorage.removeItem("authName");localStorage.removeItem("authPassword");showLogin()};els.backLobby.onclick=()=>{if(ws)ws.close();roomCode="";playerId="";localStorage.removeItem("roomCode");localStorage.removeItem("playerId");sessionStorage.removeItem("playerId");showLobby();setTimeout(loadRooms,300)};window.onpopstate=()=>{const pathRoom=roomCodeFromPath();if(pathRoom&&authName()){roomCode=pathRoom;els.roomCode.value=roomCode;showGame();connect()}else if(authName()){showLobby()}else{showLogin()}};els.cancelJoinPrompt.onclick=closeJoinPrompt;els.confirmJoinPrompt.onclick=()=>joinLobbyRoom(pendingJoinRoomCode,els.joinPromptPassword.value||"");els.joinPromptPassword.onkeydown=e=>{if(e.key==="Enter")joinLobbyRoom(pendingJoinRoomCode,els.joinPromptPassword.value||"")};els.refreshRooms.onclick=loadRooms;els.createLobbyRoom.onclick=createLobbyRoom;els.create.onclick=createRoom;els.join.onclick=joinRoom;els.startHand.onclick=()=>send("start_hand");els.shuffleSeats.onclick=()=>send("shuffle_seats");els.addBot.onclick=()=>send("add_bot");els.joinSeat.onclick=()=>send("request_seat");function markSettingsDirty(){settingsDirty=settingsKey()!==appliedSettingsKey;updateSettingsButton(latest?latest.state.stage==="lobby"||latest.state.stage==="showdown":true)}els.smallBlind.oninput=()=>{els.bigBlind.min=els.smallBlind.value;if(Number(els.bigBlind.value)<Number(els.smallBlind.value))els.bigBlind.value=els.smallBlind.value;markSettingsDirty()};els.bigBlind.oninput=markSettingsDirty;els.chipsPerBuyIn.oninput=markSettingsDirty;els.actionTimeout.oninput=markSettingsDirty;els.buyTimeSeconds.oninput=markSettingsDirty;els.peekPriceMin.oninput=()=>{if(Number(els.peekPriceMax.value)<Number(els.peekPriceMin.value))els.peekPriceMax.value=els.peekPriceMin.value;markSettingsDirty()};els.peekPriceMax.oninput=markSettingsDirty;els.setBlinds.onclick=()=>{settingsDirty=false;appliedSettingsKey=settingsKey();updateSettingsButton(latest?latest.state.stage==="lobby"||latest.state.stage==="showdown":true);send("set_blinds",{smallBlind:Number(els.smallBlind.value),bigBlind:Number(els.bigBlind.value),chipsPerBuyIn:Number(els.chipsPerBuyIn.value),actionTimeout:Number(els.actionTimeout.value),buyTimeSeconds:Number(els.buyTimeSeconds.value),peekPriceMin:Number(els.peekPriceMin.value),peekPriceMax:Number(els.peekPriceMax.value)})};function markSquidDirty(){squidSettingsDirty=squidKey()!==appliedSquidKey;updateSquidButton(latest&&latest.state&&latest.state.squid?latest.state.squid.canConfigure:true,!!(latest&&latest.state&&latest.state.squid&&latest.state.squid.canRestart))}els.squidTotal.oninput=markSquidDirty;els.squidPrice.oninput=markSquidDirty;els.foldSquid.onchange=markSquidDirty;els.setSquid.onclick=()=>{squidSettingsDirty=false;appliedSquidKey=squidKey();updateSquidButton(latest&&latest.state&&latest.state.squid?latest.state.squid.canConfigure:true,!!(latest&&latest.state&&latest.state.squid&&latest.state.squid.canRestart));send("set_squid",{total:Number(els.squidTotal.value),price:Number(els.squidPrice.value),foldSquid:els.foldSquid.checked})};els.peekToggle.onclick=()=>send("set_peek_enabled",{enabled:!(latest&&latest.state&&latest.state.peekEnabled)});els.worshipToggle.onclick=()=>send("set_worship_enabled",{enabled:!(latest&&latest.state&&latest.state.worshipEnabled)});els.prefold.onclick=()=>send("prefold",{bettingRound:latest?.state.bettingRound});els.fold.onclick=()=>send("fold");els.check.onclick=()=>send("check");els.call.onclick=()=>send("call");function closeAllInConfirm(){els.allInConfirm.classList.add("hidden")}els.allIn.onclick=()=>{if(!els.allIn.disabled)els.allInConfirm.classList.remove("hidden")};els.allInCancel.onclick=closeAllInConfirm;els.allInConfirmBtn.onclick=()=>{closeAllInConfirm();send("all_in")};els.allInConfirm.onclick=e=>{if(e.target===els.allInConfirm)closeAllInConfirm()};els.buyTime.onclick=()=>send("buy_time");els.showEndedHand.onclick=()=>send("show_ended_hand");els.noStraddle.onclick=()=>send(latest&&latest.you&&(latest.you.canShowdownAct||latest.you.canOptionalShow)?"muck_hand":"no_straddle");els.straddle.onclick=()=>send(latest&&latest.you&&(latest.you.canShowdownAct||latest.you.canOptionalShow)?"show_hand":"straddle");document.querySelectorAll(".quick-bet").forEach(btn=>btn.onclick=()=>quickBetTo(Number(btn.dataset.potPercent||0)));els.raise.onclick=submitRaise;els.raiseAmount.onkeydown=event=>{if(event.key==="Enter"){event.preventDefault();submitRaise()}};els.readyNext.onclick=()=>{if(latest&&latest.you&&latest.you.readyNextHand)send("start_hand");else send("ready_next_hand")};els.rebuy.onclick=()=>send("rebuy",{units:Number(els.rebuyUnits.value||0)});function sendChat(){const text=(els.chatInput.value||"").trim();if(!text)return;els.chatInput.value="";send("chat",{text})}els.chatSend.onclick=sendChat;els.chatInput.onkeydown=e=>{if(e.key==="Enter")sendChat()};setInterval(updateClock,1000);if(authName()){const pathRoom=roomCodeFromPath();if(pathRoom){roomCode=pathRoom;els.roomCode.value=roomCode;showGame();connect()}else{showLobby()}}else{showLogin()}
 </script></body></html>
 """
